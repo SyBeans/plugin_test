@@ -10,8 +10,6 @@ import 'package:hand_landmarker/hand_landmarker.dart';
 // ============================================================
 // TUNING FLAGS
 // ============================================================
-const bool kMirrorX = true;
-const bool kRotate90 = true;
 const bool kSwapDims = true;
 const bool kUseContain = false;
 
@@ -23,13 +21,23 @@ const double kOffsetShiftY = 0.0;
 const double kHandScale = 0.55;
 
 // Dot sizes
-const double kFaceDotRadius = 1.0; // was 1.6 — smaller so face shows
-const double kHandTipRadius = 3.0; // was 4.0
-const double kHandJointRadius = 1.8; // was 2.5
-const double kFaceDotOpacity = 0.55; // 0..1 — lower = more transparent
+const double kFaceDotRadius = 1.0;
+const double kHandTipRadius = 3.0;
+const double kHandJointRadius = 1.8;
+const double kFaceDotOpacity = 0.55;
+
+// Performance
+const int kFrameSkip = 1;
 
 // Debug
 const bool kShowDebugFrame = false;
+
+// Back camera rotation mode — try 0,1,2,3 if dots are wrong
+// 0: same as front (270° style)
+// 1: 90° CW
+// 2: 180°
+// 3: no rotation
+const int kBackRotationMode = 1;
 // ============================================================
 
 class Landmark {
@@ -82,7 +90,6 @@ class CameraScreen extends StatefulWidget {
 }
 
 class _CameraScreenState extends State<CameraScreen> {
-  // Nullable — assigned synchronously in initState, awaits init later
   CameraController? _controller;
   FaceDetector? _faceDetector;
   HandLandmarkerPlugin? _handPlugin;
@@ -96,6 +103,14 @@ class _CameraScreenState extends State<CameraScreen> {
   int _lastFpsTime = DateTime.now().millisecondsSinceEpoch;
   int _framesSinceFps = 0;
   List<Landmark> _lastHandLandmarks = [];
+  int _frameSkipCounter = 0;
+
+  late CameraDescription _currentCamera;
+  int _cameraIndex = 0;
+  bool _isSwitching = false;
+
+  bool get _isFrontCamera =>
+      _currentCamera.lensDirection == CameraLensDirection.front;
 
   String _sensorOrientation = '?';
   String _previewSize = '?';
@@ -104,20 +119,12 @@ class _CameraScreenState extends State<CameraScreen> {
   void initState() {
     super.initState();
 
-    // Create controller synchronously — prevents LateInitializationError
-    final frontCamera = widget.cameras.firstWhere(
+    _cameraIndex = widget.cameras.indexWhere(
       (c) => c.lensDirection == CameraLensDirection.front,
-      orElse: () => widget.cameras.first,
     );
-    _controller = CameraController(
-      frontCamera,
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
+    if (_cameraIndex < 0) _cameraIndex = 0;
+    _currentCamera = widget.cameras[_cameraIndex];
 
-    _sensorOrientation = '${frontCamera.sensorOrientation}°';
-
-    // Now run the async init
     _initializeCamera();
   }
 
@@ -127,6 +134,21 @@ class _CameraScreenState extends State<CameraScreen> {
       debugPrint('Camera permission denied');
       return;
     }
+
+    if (_controller != null) {
+      try {
+        await _controller!.dispose();
+      } catch (_) {}
+      _controller = null;
+    }
+
+    _sensorOrientation = '${_currentCamera.sensorOrientation}°';
+
+    _controller = CameraController(
+      _currentCamera,
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
 
     try {
       await _controller!.initialize();
@@ -140,14 +162,14 @@ class _CameraScreenState extends State<CameraScreen> {
         ? 'null'
         : '${pv.width.toInt()} × ${pv.height.toInt()}';
 
-    _faceDetector = await FaceDetector.create();
-    _handPlugin = HandLandmarkerPlugin.create(
+    _faceDetector ??= await FaceDetector.create();
+    _handPlugin ??= HandLandmarkerPlugin.create(
       numHands: 2,
       minHandDetectionConfidence: 0.5,
       delegate: HandLandmarkerDelegate.gpu,
     );
 
-    _handSub = _handPlugin!.landmarkStream.listen((hands) {
+    _handSub ??= _handPlugin!.landmarkStream.listen((hands) {
       final lms = <Landmark>[];
       for (final hand in hands) {
         for (final lm in hand.landmarks) {
@@ -160,13 +182,38 @@ class _CameraScreenState extends State<CameraScreen> {
     if (mounted) {
       setState(() {
         _previewSize = previewStr;
+        _isSwitching = false;
       });
     }
     _controller!.startImageStream(_processCameraImage);
   }
 
+  Future<void> _switchCamera() async {
+    if (_isSwitching || widget.cameras.length < 2) return;
+
+    setState(() {
+      _isSwitching = true;
+      _lastResult = null;
+      _lastHandLandmarks = [];
+    });
+
+    try {
+      await _controller?.stopImageStream();
+    } catch (_) {}
+
+    _cameraIndex = (_cameraIndex + 1) % widget.cameras.length;
+    _currentCamera = widget.cameras[_cameraIndex];
+
+    await _initializeCamera();
+  }
+
   Future<void> _processCameraImage(CameraImage image) async {
     if (_isDetecting) return;
+    if (_isSwitching) return;
+
+    _frameSkipCounter++;
+    if (_frameSkipCounter % (kFrameSkip + 1) != 0) return;
+
     _isDetecting = true;
     final stopwatch = Stopwatch()..start();
 
@@ -244,15 +291,19 @@ class _CameraScreenState extends State<CameraScreen> {
   Widget build(BuildContext context) {
     final ctrl = _controller;
 
-    // Guard: controller not yet created or not initialized
     if (ctrl == null || !ctrl.value.isInitialized) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Plugin Test'),
+        title: Text('Plugin Test (${_isFrontCamera ? "Front" : "Back"})'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.cameraswitch),
+            tooltip: 'Switch camera',
+            onPressed: _isSwitching ? null : _switchCamera,
+          ),
           IconButton(
             icon: Icon(_showOverlay ? Icons.visibility : Icons.visibility_off),
             onPressed: () => setState(() => _showOverlay = !_showOverlay),
@@ -282,7 +333,18 @@ class _CameraScreenState extends State<CameraScreen> {
                   faceLandmarks: _lastResult!.faceLandmarks,
                   handLandmarks: _lastResult!.handLandmarks,
                   previewSize: ctrl.value.previewSize!,
+                  mirror: _isFrontCamera,
+                  isFrontCamera: _isFrontCamera,
+                  sensorOrientation: _currentCamera.sensorOrientation,
                 ),
+              ),
+            ),
+
+          if (_isSwitching)
+            const Positioned.fill(
+              child: ColoredBox(
+                color: Colors.black54,
+                child: Center(child: CircularProgressIndicator()),
               ),
             ),
 
@@ -320,6 +382,10 @@ class _CameraScreenState extends State<CameraScreen> {
             style: const TextStyle(color: Colors.white),
           ),
           const Divider(color: Colors.white24, height: 12),
+          Text(
+            'Cam: ${_isFrontCamera ? "Front" : "Back"}',
+            style: const TextStyle(color: Colors.cyan, fontSize: 12),
+          ),
           Text(
             'Sensor: $_sensorOrientation',
             style: const TextStyle(color: Colors.yellow, fontSize: 12),
@@ -387,11 +453,17 @@ class LandmarkPainter extends CustomPainter {
   final List<Landmark> faceLandmarks;
   final List<Landmark> handLandmarks;
   final Size previewSize;
+  final bool mirror;
+  final bool isFrontCamera;
+  final int sensorOrientation;
 
   LandmarkPainter({
     required this.faceLandmarks,
     required this.handLandmarks,
     required this.previewSize,
+    required this.mirror,
+    required this.isFrontCamera,
+    required this.sensorOrientation,
   });
 
   static const _handConnections = [
@@ -418,16 +490,48 @@ class LandmarkPainter extends CustomPainter {
     [0, 17],
   ];
 
-  Offset _mapFace(Landmark lm, double sw, double sh, double ox, double oy) {
-    double nx = lm.x, ny = lm.y;
-    if (kRotate90) {
-      final t = nx;
-      nx = ny;
-      ny = 1.0 - t;
+  /// Apply rotation based on sensor orientation.
+  /// Front cam (270°): standard rotation
+  /// Back cam (90°): different rotation — controlled by kBackRotationMode
+  Offset _rotate(double x, double y) {
+    if (isFrontCamera) {
+      // Front camera: 270° sensor
+      final t = x;
+      return Offset(y, 1.0 - t);
+    } else {
+      // Back camera: 90° sensor — different rotation
+      switch (kBackRotationMode) {
+        case 0:
+          // Same as front
+          final t = x;
+          return Offset(y, 1.0 - t);
+        case 1:
+          // 90° CW
+          final t = x;
+          return Offset(1.0 - y, t);
+        case 2:
+          // 180°
+          return Offset(1.0 - x, 1.0 - y);
+        case 3:
+          // No rotation
+          return Offset(x, y);
+        default:
+          final t = x;
+          return Offset(1.0 - y, t);
+      }
     }
-    if (kMirrorX) nx = 1.0 - nx;
+  }
+
+  Offset _mapFace(Landmark lm, double sw, double sh, double ox, double oy) {
+    var p = _rotate(lm.x, lm.y);
+    double nx = p.dx;
+    double ny = p.dy;
+
+    if (mirror) nx = 1.0 - nx;
+
     nx += kOffsetShiftX;
     ny += kOffsetShiftY;
+
     return Offset(nx * sw + ox, ny * sh + oy);
   }
 
@@ -440,16 +544,20 @@ class LandmarkPainter extends CustomPainter {
     Offset anchor,
     double scale,
   ) {
-    double nx = anchor.dx + (lm.x - anchor.dx) * scale;
-    double ny = anchor.dy + (lm.y - anchor.dy) * scale;
-    if (kRotate90) {
-      final t = nx;
-      nx = ny;
-      ny = 1.0 - t;
-    }
-    if (kMirrorX) nx = 1.0 - nx;
+    // Scale around hand anchor — but rotation must be applied AFTER
+    // scaling, so we scale in raw space first, then rotate.
+    final sx = anchor.dx + (lm.x - anchor.dx) * scale;
+    final sy = anchor.dy + (lm.y - anchor.dy) * scale;
+
+    var p = _rotate(sx, sy);
+    double nx = p.dx;
+    double ny = p.dy;
+
+    if (mirror) nx = 1.0 - nx;
+
     nx += kOffsetShiftX;
     ny += kOffsetShiftY;
+
     return Offset(nx * sw + ox, ny * sh + oy);
   }
 
@@ -484,8 +592,6 @@ class LandmarkPainter extends CustomPainter {
       );
     }
 
-    // ---------- FACE ----------
-    // Smaller dots + semi-transparent → face visible underneath
     final paintFace = Paint()
       ..color = Colors.red.withOpacity(kFaceDotOpacity)
       ..style = PaintingStyle.fill;
@@ -494,7 +600,6 @@ class LandmarkPainter extends CustomPainter {
       canvas.drawCircle(p, kFaceDotRadius, paintFace);
     }
 
-    // ---------- HANDS ----------
     final paintHand = Paint()
       ..color = Colors.green
       ..strokeWidth = 2.0
