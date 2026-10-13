@@ -13,7 +13,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // Keep .tflite files uncompressed in the APK
     androidResources {
         noCompress += "tflite"
     }
@@ -39,6 +38,19 @@ kotlin {
     }
 }
 
+// Force one TFLite stack (litert 1.4.2 from tflite_flutter 0.11.x)
+// Excludes the OLD org.tensorflow packages that clash on namespace
+configurations.all {
+    exclude(group = "org.tensorflow", module = "tensorflow-lite")
+    exclude(group = "org.tensorflow", module = "tensorflow-lite-gpu")
+    exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
+}
+
+dependencies {
+    // Flex delegate for sign_model.tflite (uses SELECT_TF_OPS)
+    // Under the new litert namespace
+    implementation("com.google.ai.edge.litert:litert-support:1.4.2")
+}
 
 flutter {
     source = "../.."
