@@ -28,7 +28,7 @@ const bool kShowDebugFrame = false;
 const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
-// Sign inference — buffer & motion
+// Sign inference
 const int kSignBufferLen = 30;
 const int kSignFeaturesPerFrame = 126;
 const double kMotionStart = 0.02;
@@ -39,6 +39,9 @@ const double kSignMinConfidence = 0.40;
 // Emotion inference
 const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.35;
+
+// Resolution options (start index)
+const int kDefaultResolutionIndex = 1; // 0=low, 1=medium, 2=high
 // ============================================================
 
 class Landmark {
@@ -60,6 +63,20 @@ class FrameResult {
     required this.inferenceTimeMs,
   });
 }
+
+/// Resolution presets — user toggles through these at runtime
+class ResolutionOption {
+  final String label;
+  final ResolutionPreset preset;
+  final IconData icon;
+  const ResolutionOption(this.label, this.preset, this.icon);
+}
+
+const List<ResolutionOption> kResolutionOptions = [
+  ResolutionOption('LOW', ResolutionPreset.low, Icons.sd_card_outlined),
+  ResolutionOption('MED', ResolutionPreset.medium, Icons.sd_card),
+  ResolutionOption('HIGH', ResolutionPreset.high, Icons.sd_card_alert_outlined),
+];
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -100,7 +117,6 @@ class _CameraScreenState extends State<CameraScreen> {
   FrameResult? _lastResult;
   int _frameCount = 0;
   double _fps = 0;
-  final List<FrameResult> _capturedFrames = [];
   int _lastFpsTime = DateTime.now().millisecondsSinceEpoch;
   int _framesSinceFps = 0;
   List<Landmark> _lastHandLandmarks = [];
@@ -112,6 +128,9 @@ class _CameraScreenState extends State<CameraScreen> {
   int _cameraIndex = 0;
   bool _isSwitching = false;
 
+  // Resolution state
+  int _resIndex = kDefaultResolutionIndex;
+
   bool get _isFrontCamera =>
       _currentCamera.lensDirection == CameraLensDirection.front;
 
@@ -119,12 +138,12 @@ class _CameraScreenState extends State<CameraScreen> {
   String _previewSize = '?';
   String _frameSize = '?';
 
-  // ---- Model services ----
+  // Model services
   final SignModelService _signService = SignModelService();
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // ---- Sign inference state ----
+  // Sign inference state
   final List<List<double>> _posBuffer = [];
   bool _handWasMoving = false;
   int _signCooldown = 0;
@@ -132,7 +151,7 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
 
-  // ---- Emotion inference state ----
+  // Emotion inference state
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
   double _lastEmotionConf = 0.0;
@@ -175,9 +194,12 @@ class _CameraScreenState extends State<CameraScreen> {
 
     _sensorOrientation = '${_currentCamera.sensorOrientation}°';
 
+    final resOption = kResolutionOptions[_resIndex];
+    debugPrint('Initializing camera at ${resOption.label} resolution');
+
     _controller = CameraController(
       _currentCamera,
-      ResolutionPreset.medium,
+      resOption.preset,
       enableAudio: false,
     );
 
@@ -229,6 +251,26 @@ class _CameraScreenState extends State<CameraScreen> {
       });
     }
     _controller!.startImageStream(_processCameraImage);
+  }
+
+  /// Switch resolution (LOW → MED → HIGH → LOW)
+  Future<void> _cycleResolution() async {
+    if (_isSwitching) return;
+
+    setState(() {
+      _isSwitching = true;
+      _lastResult = null;
+      _lastHandLandmarks = [];
+      _posBuffer.clear();
+      _handWasMoving = false;
+      _resIndex = (_resIndex + 1) % kResolutionOptions.length;
+    });
+
+    try {
+      await _controller?.stopImageStream();
+    } catch (_) {}
+
+    await _initializeCamera();
   }
 
   Future<void> _switchCamera() async {
@@ -312,12 +354,8 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
 
-      // ---- Run sign inference every frame ----
-      if (_modelsReady) {
-        _updateSignBuffer();
-      }
+      if (_modelsReady) _updateSignBuffer();
 
-      // ---- Run emotion inference every Nth frame ----
       if (_modelsReady && faceLandmarks.length >= 400) {
         _emotionFrameCounter++;
         if (_emotionFrameCounter % kEmotionEveryNFrames == 0) {
@@ -341,7 +379,6 @@ class _CameraScreenState extends State<CameraScreen> {
       return;
     }
 
-    // Build 126-feature frame (2 hands × 63)
     final frame = List<double>.filled(kSignFeaturesPerFrame, 0.0);
     final handCount = _lastHandLandmarks.length ~/ 21;
     for (int h = 0; h < math.min(handCount, 2); h++) {
@@ -354,7 +391,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    // Motion detection
     if (_posBuffer.isNotEmpty) {
       final prev = _posBuffer.last;
       double motion = 0.0;
@@ -376,23 +412,17 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     _posBuffer.add(frame);
-    if (_posBuffer.length > kSignBufferLen) {
-      _posBuffer.removeAt(0);
-    }
-
+    if (_posBuffer.length > kSignBufferLen) _posBuffer.removeAt(0);
     if (_signCooldown > 0) _signCooldown--;
   }
 
   void _runSignInference() {
-    // Build (30, 252): [position | velocity]
     final sequence = <List<double>>[];
     for (int i = 0; i < kSignBufferLen; i++) {
       final frame = List<double>.filled(252, 0.0);
-      // Position (first 126)
       for (int j = 0; j < kSignFeaturesPerFrame; j++) {
         frame[j] = _posBuffer[i][j];
       }
-      // Velocity (last 126) — zero for frame 0
       if (i > 0) {
         for (int j = 0; j < kSignFeaturesPerFrame; j++) {
           frame[kSignFeaturesPerFrame + j] =
@@ -420,19 +450,15 @@ class _CameraScreenState extends State<CameraScreen> {
   // EMOTION INFERENCE
   // ============================================================
   void _runEmotionInference(CameraImage image, List<Landmark> faceLandmarks) {
-    // Rotate landmarks to preview orientation
     final preview = <Landmark>[];
     for (final lm in faceLandmarks) {
       if (_isFrontCamera) {
-        // Front (sensor 270): preview(x,y) = (lm.y, 1 - lm.x)
         preview.add(Landmark(lm.y, 1.0 - lm.x, lm.z));
       } else {
-        // Back (sensor 90): different rotation — mirror of front
         preview.add(Landmark(1.0 - lm.y, lm.x, lm.z));
       }
     }
 
-    // Compute crop box in preview space (matches training pipeline)
     double xMin = preview.map((l) => l.x).reduce(math.min);
     double xMax = preview.map((l) => l.x).reduce(math.max);
     double yMin = preview.map((l) => l.y).reduce(math.min);
@@ -447,7 +473,6 @@ class _CameraScreenState extends State<CameraScreen> {
     double y0 = (cy - size * 0.65).clamp(0.0, 1.0);
     double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
 
-    // Extract 48×48 crop from Y plane (with rotation back to raw coords)
     final yPlane = image.planes[0];
     final bytes = yPlane.bytes;
     final rowStride = yPlane.bytesPerRow;
@@ -459,14 +484,11 @@ class _CameraScreenState extends State<CameraScreen> {
         double px = x0 + (xx / 48.0) * (x1 - x0);
         double py = y0 + (yy / 48.0) * (y1 - y0);
 
-        // Map preview → raw
         double rawX, rawY;
         if (_isFrontCamera) {
-          // preview (px, py) → raw (1 - py, px)
           rawX = 1.0 - py;
           rawY = px;
         } else {
-          // Back cam: mirror of that
           rawX = py;
           rawY = 1.0 - px;
         }
@@ -481,7 +503,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    // Landmarks for model: 936 = 468 × 2 (x, y only)
     final lmVec = <double>[];
     for (final lm in faceLandmarks) {
       lmVec.add(lm.x);
@@ -520,10 +541,22 @@ class _CameraScreenState extends State<CameraScreen> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
+    final resOption = kResolutionOptions[_resIndex];
+
     return Scaffold(
       appBar: AppBar(
         title: Text('Plugin Test (${_isFrontCamera ? "Front" : "Back"})'),
         actions: [
+          // Resolution toggle
+          TextButton.icon(
+            onPressed: _isSwitching ? null : _cycleResolution,
+            icon: Icon(resOption.icon, size: 18),
+            label: Text(
+              resOption.label,
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            style: TextButton.styleFrom(foregroundColor: Colors.black87),
+          ),
           IconButton(
             icon: const Icon(Icons.cameraswitch),
             onPressed: _isSwitching ? null : _switchCamera,
@@ -557,14 +590,11 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
 
-          // ---- Stats top-left ----
           Positioned(top: 20, left: 20, child: _buildStats()),
 
-          // ---- Emotion top-right ----
           if (_modelsReady)
             Positioned(top: 20, right: 20, child: _buildEmotionPanel()),
 
-          // ---- Sign bottom ----
           if (_modelsReady)
             Positioned(
               bottom: 20,
@@ -625,6 +655,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Widget _buildStats() {
+    final resOption = kResolutionOptions[_resIndex];
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -653,8 +684,16 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
           const SizedBox(height: 4),
           Text(
+            'Res: ${resOption.label}',
+            style: const TextStyle(color: Colors.cyan, fontSize: 11),
+          ),
+          Text(
             'Preview: $_previewSize',
             style: const TextStyle(color: Colors.yellow, fontSize: 10),
+          ),
+          Text(
+            'Frame: $_frameSize',
+            style: const TextStyle(color: Colors.pink, fontSize: 10),
           ),
         ],
       ),
