@@ -39,10 +39,6 @@ kotlin {
     }
 }
 
-dependencies {
-    // TensorFlow Lite Select TF Ops (Flex delegate) — needed for sign_model.tflite
-    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1")
-}
 
 flutter {
     source = "../.."
