@@ -1,17 +1,69 @@
-# plugin_test
+# Signify — Plugin Test App
 
-A new Flutter project.
+Standalone Flutter app to verify the two landmark plugins (face + hands) and
+the two TFLite models (sign + emotion) before integrating them into the main
+Signify app.
 
-## Getting Started
+## What This App Does
 
-This project is a starting point for a Flutter application.
+- Runs the **front or back camera** in real time
+- Detects **468 face landmarks** (`face_detection_tflite`)
+- Detects **21 hand landmarks × 2 hands** (`hand_landmarker`)
+- Draws landmarks as colored dots over the preview
+- Runs **sign_model.tflite** on hand landmark sequences (motion-based)
+- Runs **emotion_model.tflite** on face crop + landmarks
+- Displays predictions live on screen
 
-A few resources to get you started if this is your first Flutter project:
+## Requirements
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+| Tool | Version |
+|---|---|
+| **Flutter** | 3.44.9 (stable channel) |
+| **Dart** | 3.12.2 |
+| **Android SDK** | Platform 36 (compileSdk = 36) |
+| **Java JDK** | 17 |
+| **Device** | Android 8.0+ with camera (phone or emulator) |
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+Verify:
+
+```bash
+flutter --version
+flutter doctor -v
+
+
+
+
+
+
+Repository Layout
+plugin_test/
+├── android/                   # Android host app (Gradle config)
+├── assets/
+│   └── models/
+│       ├── sign_model.tflite         # 3.12 MB, 105 sign classes
+│       ├── emotion_model.tflite      # 7.48 MB, 4 emotion classes
+│       └── labels.json               # 105 sign label names
+├── lib/
+│   ├── main.dart                     # main screen (camera + inference)
+│   └── services/
+│       ├── sign_model_service.dart   # TFLite wrapper for sign model
+│       └── emotion_model_service.dart# TFLite wrapper for emotion model
+├── pubspec.yaml
+└── README.md
+
+
+
+First-Time Setup
+# 1. Clone or copy the plugin_test folder
+cd ~/plugin_test
+
+# 2. Get packages
+flutter pub get
+
+# 3. Plug in the Android device (USB debugging enabled)
+flutter devices
+
+# 4. Build + install
+flutter run
+First build takes ~5 minutes (Gradle downloads + compiles native libs).
+After that, rebuilds are ~30 seconds.
