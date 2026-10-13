@@ -18,6 +18,8 @@ dependencies:
   # mediapipe_face_mesh: ^3.1.0
   hand_landmarker: ^3.1.0
   # hand_detection: ^1.0.2
+  tflite_flutter: ^0.11.0            # <-- add this
+  
 
 dev_dependencies:
   flutter_test:
@@ -26,3 +28,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/models/
