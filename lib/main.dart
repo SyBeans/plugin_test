@@ -27,15 +27,22 @@ const bool kShowDebugFrame = false;
 const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
+// ═══════════════════════════════════════════════════════════
+// STREAMING SIGN MODE
+// ═══════════════════════════════════════════════════════════
 const int kSignBufferLen = 30;
 const int kSignFeaturesPerFrame = 126;
-const double kMotionStart = 0.02;
-const double kMotionEnd = 0.008;
-const int kSignCooldownFrames = 30;
+const int kSignPredictEveryNFrames = 5;
+const int kSmoothingWindow = 5;
+const int kStableVoteCount = 3;
 const double kSignMinConfidence = 0.40;
 
+// ═══════════════════════════════════════════════════════════
+// EMOTION
+// ═══════════════════════════════════════════════════════════
 const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.35;
+const Duration kEmotionCropTimeout = Duration(milliseconds: 400);
 
 const int kDefaultResolutionIndex = 1;
 
@@ -134,23 +141,29 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
+  // ── Streaming sign state ──
   final List<List<double>> _posBuffer = [];
-  bool _handWasMoving = false;
-  int _signCooldown = 0;
+  int _signPredictCounter = 0;
+  final List<String> _recentSignPredictions = [];
   String _lastSign = '—';
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
+  String _bufferState = 'no hand';
 
+  // ── Emotion state ──
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
   double _lastEmotionConf = 0.0;
+  String? _emotionError; // non-null when last emotion attempt failed
+  double _lastCropMean = 0.0;
+  double _lastLmMean = 0.0;
+  bool _emotionInFlight = false; // prevents piling up async runs
 
-  // Always-visible debug data
+  // ── Debug data ──
   int _cropRotation = 0;
   List<double> _lastEmotionProbs = [0, 0, 0, 0];
   List<double> _lastSignProbs = [];
   double _lastMotion = 0.0;
-  String _bufferState = 'idle';
   Uint8List? _lastCropPng;
 
   @override
@@ -252,7 +265,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _lastResult = null;
       _lastHandLandmarks = [];
       _posBuffer.clear();
-      _handWasMoving = false;
+      _recentSignPredictions.clear();
       _resIndex = (_resIndex + 1) % kResolutionOptions.length;
     });
     try {
@@ -268,7 +281,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _lastResult = null;
       _lastHandLandmarks = [];
       _posBuffer.clear();
-      _handWasMoving = false;
+      _recentSignPredictions.clear();
     });
     try {
       await _controller?.stopImageStream();
@@ -341,10 +354,16 @@ class _CameraScreenState extends State<CameraScreen> {
 
       if (_modelsReady) _updateSignBuffer();
 
-      if (_modelsReady && faceLandmarks.length >= 400) {
+      if (_modelsReady && faceLandmarks.length >= 400 && !_emotionInFlight) {
         _emotionFrameCounter++;
         if (_emotionFrameCounter % kEmotionEveryNFrames == 0) {
-          await _runEmotionInference(image, faceLandmarks);
+          _emotionInFlight = true;
+          // Fire and forget — do NOT await inside the frame pipeline,
+          // otherwise a slow crop/PNG stalls the next camera frame.
+          _runEmotionInference(
+            image,
+            faceLandmarks,
+          ).whenComplete(() => _emotionInFlight = false);
         }
       }
     } catch (e, st) {
@@ -354,10 +373,13 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // STREAMING SIGN — sliding window + temporal smoothing
+  // ═══════════════════════════════════════════════════════════
   void _updateSignBuffer() {
     if (_lastHandLandmarks.isEmpty) {
       _posBuffer.clear();
-      _handWasMoving = false;
+      _recentSignPredictions.clear();
       _bufferState = 'no hand';
       return;
     }
@@ -374,34 +396,31 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    if (_posBuffer.isNotEmpty) {
-      final prev = _posBuffer.last;
+    _posBuffer.add(frame);
+    if (_posBuffer.length > kSignBufferLen) _posBuffer.removeAt(0);
+
+    if (_posBuffer.length >= 2) {
+      final prev = _posBuffer[_posBuffer.length - 2];
       double motion = 0.0;
       for (int i = 0; i < kSignFeaturesPerFrame; i++) {
         motion += (frame[i] - prev[i]).abs();
       }
-      motion /= kSignFeaturesPerFrame;
-      _lastMotion = motion;
-
-      if (motion > kMotionStart) {
-        _handWasMoving = true;
-        _bufferState = 'moving';
-      }
-
-      if (_handWasMoving && motion < kMotionEnd && _signCooldown == 0) {
-        if (_posBuffer.length >= kSignBufferLen) {
-          _runSignInference();
-        }
-        _posBuffer.clear();
-        _handWasMoving = false;
-        _signCooldown = kSignCooldownFrames;
-        _bufferState = 'triggered';
-      }
+      _lastMotion = motion / kSignFeaturesPerFrame;
     }
 
-    _posBuffer.add(frame);
-    if (_posBuffer.length > kSignBufferLen) _posBuffer.removeAt(0);
-    if (_signCooldown > 0) _signCooldown--;
+    if (_posBuffer.length < kSignBufferLen) {
+      _bufferState = 'filling ${_posBuffer.length}/30';
+      return;
+    }
+
+    _signPredictCounter++;
+    if (_signPredictCounter % kSignPredictEveryNFrames != 0) {
+      _bufferState = 'streaming';
+      return;
+    }
+
+    _bufferState = 'streaming';
+    _runSignInference();
   }
 
   void _runSignInference() {
@@ -426,114 +445,208 @@ class _CameraScreenState extends State<CameraScreen> {
     final (label, conf, probs) = result;
     setState(() {
       _lastSignProbs = probs;
-      if (conf >= kSignMinConfidence) {
-        _lastSign = label;
-        _lastSignConf = conf;
-        _sentenceBuffer.add(label);
-      }
+      _lastSign = label;
+      _lastSignConf = conf;
     });
+
+    if (conf >= kSignMinConfidence) {
+      _recentSignPredictions.add(label);
+      if (_recentSignPredictions.length > kSmoothingWindow) {
+        _recentSignPredictions.removeAt(0);
+      }
+    }
+
+    if (_recentSignPredictions.isEmpty) return;
+
+    final counts = <String, int>{};
+    for (final p in _recentSignPredictions) {
+      counts[p] = (counts[p] ?? 0) + 1;
+    }
+    final smoothed = counts.entries
+        .reduce((a, b) => a.value >= b.value ? a : b)
+        .key;
+
+    if ((counts[smoothed] ?? 0) >= kStableVoteCount) {
+      if (_sentenceBuffer.isEmpty || _sentenceBuffer.last != smoothed) {
+        setState(() {
+          _sentenceBuffer.add(smoothed);
+          _recentSignPredictions.clear();
+        });
+      }
+    }
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // EMOTION
+  // ═══════════════════════════════════════════════════════════
   Future<void> _runEmotionInference(
     CameraImage image,
     List<Landmark> faceLandmarks,
   ) async {
-    final preview = <Landmark>[];
-    for (final lm in faceLandmarks) {
-      if (_isFrontCamera) {
-        preview.add(Landmark(lm.y, 1.0 - lm.x, lm.z));
-      } else {
-        preview.add(Landmark(1.0 - lm.y, lm.x, lm.z));
-      }
-    }
-
-    double xMin = preview.map((l) => l.x).reduce(math.min);
-    double xMax = preview.map((l) => l.x).reduce(math.max);
-    double yMin = preview.map((l) => l.y).reduce(math.min);
-    double yMax = preview.map((l) => l.y).reduce(math.max);
-
-    double cx = (xMin + xMax) / 2;
-    double cy = (yMin + yMax) / 2;
-    double size = math.max(xMax - xMin, yMax - yMin) * 1.55;
-
-    double x0 = (cx - size * 0.50).clamp(0.0, 1.0);
-    double x1 = (cx + size * 0.50).clamp(0.0, 1.0);
-    double y0 = (cy - size * 0.65).clamp(0.0, 1.0);
-    double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
-
-    final yPlane = image.planes[0];
-    final bytes = yPlane.bytes;
-    final rowStride = yPlane.bytesPerRow;
-    final pixelStride = yPlane.bytesPerPixel ?? 1;
-
-    final raw = List<double>.filled(48 * 48, 0.0);
-    for (int yy = 0; yy < 48; yy++) {
-      for (int xx = 0; xx < 48; xx++) {
-        double px = x0 + (xx / 48.0) * (x1 - x0);
-        double py = y0 + (yy / 48.0) * (y1 - y0);
-
-        double rawX, rawY;
+    // Any error sets `_emotionError` so the debug strip shows what failed,
+    // and ensures we never silently die again.
+    String? localError;
+    try {
+      // 1) Map raw image-space landmarks → preview space (matches painter)
+      final preview = <Landmark>[];
+      for (final lm in faceLandmarks) {
         if (_isFrontCamera) {
-          rawX = 1.0 - py;
-          rawY = px;
+          preview.add(Landmark(lm.y, 1.0 - lm.x, lm.z));
         } else {
-          rawX = py;
-          rawY = 1.0 - px;
-        }
-
-        int srcX = (rawX * image.width).toInt().clamp(0, image.width - 1);
-        int srcY = (rawY * image.height).toInt().clamp(0, image.height - 1);
-        int idx = srcY * rowStride + srcX * pixelStride;
-        if (idx >= 0 && idx < bytes.length) {
-          raw[yy * 48 + xx] = bytes[idx] / 255.0;
+          preview.add(Landmark(1.0 - lm.y, lm.x, lm.z));
         }
       }
-    }
 
-    final crop = List<double>.filled(48 * 48, 0.0);
-    for (int y = 0; y < 48; y++) {
-      for (int x = 0; x < 48; x++) {
-        int srcIdx;
-        switch (_cropRotation) {
-          case 90:
-            srcIdx = x * 48 + (47 - y);
-            break;
-          case 180:
-            srcIdx = (47 - y) * 48 + (47 - x);
-            break;
-          case 270:
-            srcIdx = (47 - x) * 48 + y;
-            break;
-          default:
-            srcIdx = y * 48 + x;
+      double xMin = preview.map((l) => l.x).reduce(math.min);
+      double xMax = preview.map((l) => l.x).reduce(math.max);
+      double yMin = preview.map((l) => l.y).reduce(math.min);
+      double yMax = preview.map((l) => l.y).reduce(math.max);
+
+      final double cx = (xMin + xMax) / 2;
+      final double cy = (yMin + yMax) / 2;
+      final double size = math.max(xMax - xMin, yMax - yMin) * 1.55;
+
+      final double x0 = (cx - size * 0.50).clamp(0.0, 1.0);
+      final double x1 = (cx + size * 0.50).clamp(0.0, 1.0);
+      final double y0 = (cy - size * 0.65).clamp(0.0, 1.0);
+      final double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
+
+      // 2) Sample Y plane into a 48x48 grayscale crop
+      final yPlane = image.planes[0];
+      final bytes = yPlane.bytes;
+      final int rowStride = yPlane.bytesPerRow;
+      final int pixelStride = yPlane.bytesPerPixel ?? 1;
+
+      final raw = List<double>.filled(48 * 48, 0.0);
+      double rawMin = double.infinity;
+      double rawMax = -double.infinity;
+      double rawSum = 0.0;
+
+      for (int yy = 0; yy < 48; yy++) {
+        for (int xx = 0; xx < 48; xx++) {
+          final double px = x0 + (xx / 48.0) * (x1 - x0);
+          final double py = y0 + (yy / 48.0) * (y1 - y0);
+
+          double rawX, rawY;
+          if (_isFrontCamera) {
+            rawX = 1.0 - py;
+            rawY = px;
+          } else {
+            rawX = py;
+            rawY = 1.0 - px;
+          }
+
+          final int srcX = (rawX * image.width).toInt().clamp(
+            0,
+            image.width - 1,
+          );
+          final int srcY = (rawY * image.height).toInt().clamp(
+            0,
+            image.height - 1,
+          );
+          final int idx = srcY * rowStride + srcX * pixelStride;
+          double v = 0.0;
+          if (idx >= 0 && idx < bytes.length) {
+            v = bytes[idx] / 255.0;
+          }
+          raw[yy * 48 + xx] = v;
+          if (v < rawMin) rawMin = v;
+          if (v > rawMax) rawMax = v;
+          rawSum += v;
         }
-        crop[y * 48 + x] = raw[srcIdx];
       }
+      final rawMean = rawSum / raw.length;
+
+      // 3) Rotate crop if user picked a rotation
+      final crop = List<double>.filled(48 * 48, 0.0);
+      for (int y = 0; y < 48; y++) {
+        for (int x = 0; x < 48; x++) {
+          int srcIdx;
+          switch (_cropRotation) {
+            case 90:
+              srcIdx = x * 48 + (47 - y);
+              break;
+            case 180:
+              srcIdx = (47 - y) * 48 + (47 - x);
+              break;
+            case 270:
+              srcIdx = (47 - x) * 48 + y;
+              break;
+            default:
+              srcIdx = y * 48 + x;
+          }
+          crop[y * 48 + x] = raw[srcIdx];
+        }
+      }
+
+      // 4) Build landmark vector
+      final lmVec = <double>[];
+      for (final lm in faceLandmarks) {
+        lmVec.add(lm.x);
+        lmVec.add(lm.y);
+      }
+      double lmMin = lmVec.reduce(math.min);
+      double lmMax = lmVec.reduce(math.max);
+      double lmSum = 0.0;
+      for (final v in lmVec) {
+        lmSum += v;
+      }
+      final lmMean = lmSum / lmVec.length;
+
+      debugPrint(
+        'EMO: crop min=${rawMin.toStringAsFixed(3)} '
+        'max=${rawMax.toStringAsFixed(3)} '
+        'mean=${rawMean.toStringAsFixed(3)} | '
+        'lm min=${lmMin.toStringAsFixed(3)} '
+        'max=${lmMax.toStringAsFixed(3)} '
+        'mean=${lmMean.toStringAsFixed(3)}',
+      );
+
+      // 5) Run model
+      final result = _emotionService.predict(crop, lmVec);
+      if (result == null) {
+        localError = 'predict → null';
+        debugPrint('EMO: predict returned null');
+      } else {
+        final (label, conf, probs) = result;
+        debugPrint(
+          'EMO: label=$label conf=${conf.toStringAsFixed(3)} probs=$probs',
+        );
+
+        // 6) Generate PNG preview (with timeout — never hang the loop)
+        Uint8List? png;
+        try {
+          png = await _cropToPng(crop).timeout(kEmotionCropTimeout);
+        } catch (e) {
+          debugPrint('EMO: cropToPng failed: $e');
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _lastEmotionProbs = probs;
+          _lastCropPng = png ?? _lastCropPng;
+          _lastCropMean = rawMean;
+          _lastLmMean = lmMean;
+          _emotionError = null;
+          if (conf >= kEmotionMinConfidence) {
+            _lastEmotion = label;
+            _lastEmotionConf = conf;
+          }
+        });
+      }
+    } catch (e, st) {
+      localError = e.toString();
+      debugPrint('EMO: THREW $e\n$st');
     }
 
-    final png = await _cropToPng(crop);
-
-    final lmVec = <double>[];
-    for (final lm in faceLandmarks) {
-      lmVec.add(lm.x);
-      lmVec.add(lm.y);
+    if (localError != null && mounted) {
+      setState(() {
+        _emotionError = localError;
+      });
     }
-
-    final result = _emotionService.predict(crop, lmVec);
-    if (result == null) return;
-
-    final (label, conf, probs) = result;
-    setState(() {
-      _lastEmotionProbs = probs;
-      _lastCropPng = png;
-      if (conf >= kEmotionMinConfidence) {
-        _lastEmotion = label;
-        _lastEmotionConf = conf;
-      }
-    });
   }
 
-  Future<Uint8List> _cropToPng(List<double> crop) async {
+  Future<Uint8List> _cropToPng(List<double> crop) {
     final rgba = Uint8List(48 * 48 * 4);
     for (int i = 0; i < 48 * 48; i++) {
       final v = (crop[i] * 255).clamp(0, 255).toInt();
@@ -542,17 +655,22 @@ class _CameraScreenState extends State<CameraScreen> {
       rgba[i * 4 + 2] = v;
       rgba[i * 4 + 3] = 255;
     }
-    final completer = Completer<ui.Image>();
-    ui.decodeImageFromPixels(
-      rgba,
-      48,
-      48,
-      ui.PixelFormat.rgba8888,
-      (img) => completer.complete(img),
-    );
-    final img = await completer.future;
-    final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-    return bd!.buffer.asUint8List();
+    final completer = Completer<Uint8List>();
+    ui.decodeImageFromPixels(rgba, 48, 48, ui.PixelFormat.rgba8888, (
+      img,
+    ) async {
+      try {
+        final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+        if (bd == null) {
+          completer.completeError('toByteData returned null');
+          return;
+        }
+        completer.complete(bd.buffer.asUint8List());
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+    return completer.future;
   }
 
   @override
@@ -575,7 +693,10 @@ class _CameraScreenState extends State<CameraScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Plugin Test', style: TextStyle(fontSize: 16)),
+        title: const Text(
+          'Plugin Test — Streaming',
+          style: TextStyle(fontSize: 16),
+        ),
         actions: [
           IconButton(
             icon: const Icon(Icons.cameraswitch),
@@ -590,7 +711,10 @@ class _CameraScreenState extends State<CameraScreen> {
           IconButton(
             icon: const Icon(Icons.delete_sweep),
             tooltip: 'Clear sentence',
-            onPressed: () => setState(() => _sentenceBuffer.clear()),
+            onPressed: () => setState(() {
+              _sentenceBuffer.clear();
+              _recentSignPredictions.clear();
+            }),
           ),
         ],
       ),
@@ -626,7 +750,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
           Positioned(top: 20, left: 20, child: _buildStats()),
 
-          // ── ALWAYS-VISIBLE DEBUG PANEL (right side, middle) ──
           if (_modelsReady)
             Positioned(top: 20, right: 20, child: _buildDebugStrip()),
 
@@ -690,11 +813,11 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // ALWAYS-VISIBLE DEBUG STRIP
+  // DEBUG STRIP (top-right)
   // ═══════════════════════════════════════════════════════════
   Widget _buildDebugStrip() {
     return Container(
-      width: 168,
+      width: 178,
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.82),
@@ -705,7 +828,6 @@ class _CameraScreenState extends State<CameraScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          // ── Crop preview (the exact 48×48 the model sees) ──
           const Text(
             'CROP',
             style: TextStyle(
@@ -743,7 +865,6 @@ class _CameraScreenState extends State<CameraScreen> {
                       ),
               ),
               const SizedBox(width: 6),
-              // Crop rotation button
               Expanded(
                 child: GestureDetector(
                   onTap: () {
@@ -784,11 +905,19 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ],
           ),
+          if (_lastCropMean > 0)
+            Padding(
+              padding: const EdgeInsets.only(top: 3),
+              child: Text(
+                'crop mean ${_lastCropMean.toStringAsFixed(2)}'
+                '  lm mean ${_lastLmMean.toStringAsFixed(2)}',
+                style: const TextStyle(color: Colors.white54, fontSize: 8),
+              ),
+            ),
           const SizedBox(height: 6),
           const Divider(color: Colors.white24, height: 1),
           const SizedBox(height: 6),
 
-          // ── Emotion probs ──
           const Text(
             'EMOTION',
             style: TextStyle(
@@ -805,17 +934,21 @@ class _CameraScreenState extends State<CameraScreen> {
           _tinyProb('Neu', _lastEmotionProbs[3]),
           const SizedBox(height: 4),
           Text(
-            '→ $_lastEmotion $_lastEmotionConf'.replaceAll(
-              RegExp(r'0\.\d+'),
-              (_lastEmotionConf * 100).toStringAsFixed(0),
+            _emotionError == null
+                ? '→ $_lastEmotion '
+                      '(${(_lastEmotionConf * 100).toStringAsFixed(0)}%)'
+                : '⚠ $_emotionError',
+            style: TextStyle(
+              color: _emotionError == null ? Colors.white70 : Colors.redAccent,
+              fontSize: 9,
             ),
-            style: const TextStyle(color: Colors.white70, fontSize: 9),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
           ),
           const Divider(color: Colors.white24, height: 8),
 
-          // ── Sign status ──
           const Text(
-            'SIGN',
+            'SIGN (STREAM)',
             style: TextStyle(
               color: Colors.cyanAccent,
               fontSize: 9,
@@ -827,13 +960,6 @@ class _CameraScreenState extends State<CameraScreen> {
           Text(
             'buf ${_posBuffer.length}/30',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
-          ),
-          Text(
-            'mv ${_lastMotion.toStringAsFixed(3)}',
-            style: TextStyle(
-              color: _lastMotion > kMotionStart ? Colors.green : Colors.white70,
-              fontSize: 9,
-            ),
           ),
           Text(
             _bufferState,
@@ -1004,10 +1130,6 @@ class _CameraScreenState extends State<CameraScreen> {
         ],
       ),
     );
-  }
-
-  Widget _buildEmotionPanel() {
-    return const SizedBox.shrink();
   }
 
   Widget _buildSignPanel() {
