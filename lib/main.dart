@@ -40,8 +40,7 @@ const double kSignMinConfidence = 0.40;
 const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.35;
 
-// Resolution options (start index)
-const int kDefaultResolutionIndex = 1; // 0=low, 1=medium, 2=high
+const int kDefaultResolutionIndex = 1;
 // ============================================================
 
 class Landmark {
@@ -64,7 +63,6 @@ class FrameResult {
   });
 }
 
-/// Resolution presets — user toggles through these at runtime
 class ResolutionOption {
   final String label;
   final ResolutionPreset preset;
@@ -90,7 +88,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Plugin Test — Live Inference',
+      title: 'Plugin Test — Debug',
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
@@ -127,8 +125,6 @@ class _CameraScreenState extends State<CameraScreen> {
   late CameraDescription _currentCamera;
   int _cameraIndex = 0;
   bool _isSwitching = false;
-
-  // Resolution state
   int _resIndex = kDefaultResolutionIndex;
 
   bool get _isFrontCamera =>
@@ -138,12 +134,11 @@ class _CameraScreenState extends State<CameraScreen> {
   String _previewSize = '?';
   String _frameSize = '?';
 
-  // Model services
   final SignModelService _signService = SignModelService();
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // Sign inference state
+  // Sign state
   final List<List<double>> _posBuffer = [];
   bool _handWasMoving = false;
   int _signCooldown = 0;
@@ -151,21 +146,43 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
 
-  // Emotion inference state
+  // Emotion state
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
   double _lastEmotionConf = 0.0;
 
+  // ═══════════════════════════════════════════════════════════
+  // DEBUG STATE
+  // ═══════════════════════════════════════════════════════════
+  bool _showDebug = false;
+  int _cropRotation = 0; // 0, 90, 180, 270
+
+  // Emotion raw
+  List<double> _lastEmotionProbs = [0, 0, 0, 0];
+  String _lastEmotionRawLabel = '—';
+  double _lastEmotionRawConf = 0.0;
+  double _lastCropMean = 0.0;
+  double _lastCropMin = 0.0;
+  double _lastCropMax = 0.0;
+
+  // Sign raw
+  List<double> _lastSignProbs = [];
+  String _lastSignRawLabel = '—';
+  double _lastSignRawConf = 0.0;
+  int _bufferLen = 0;
+  double _lastMotion = 0.0;
+  String _bufferState = 'idle';
+
+  // ═══════════════════════════════════════════════════════════
+
   @override
   void initState() {
     super.initState();
-
     _cameraIndex = widget.cameras.indexWhere(
       (c) => c.lensDirection == CameraLensDirection.front,
     );
     if (_cameraIndex < 0) _cameraIndex = 0;
     _currentCamera = widget.cameras[_cameraIndex];
-
     _loadModels();
     _initializeCamera();
   }
@@ -193,9 +210,7 @@ class _CameraScreenState extends State<CameraScreen> {
     }
 
     _sensorOrientation = '${_currentCamera.sensorOrientation}°';
-
     final resOption = kResolutionOptions[_resIndex];
-    debugPrint('Initializing camera at ${resOption.label} resolution');
 
     _controller = CameraController(
       _currentCamera,
@@ -230,7 +245,6 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       }
       _lastHandLandmarks = lms;
-
       if (lms.length >= 21) {
         final xs = lms.map((l) => l.x).toList();
         final span =
@@ -253,10 +267,8 @@ class _CameraScreenState extends State<CameraScreen> {
     _controller!.startImageStream(_processCameraImage);
   }
 
-  /// Switch resolution (LOW → MED → HIGH → LOW)
   Future<void> _cycleResolution() async {
     if (_isSwitching) return;
-
     setState(() {
       _isSwitching = true;
       _lastResult = null;
@@ -265,11 +277,9 @@ class _CameraScreenState extends State<CameraScreen> {
       _handWasMoving = false;
       _resIndex = (_resIndex + 1) % kResolutionOptions.length;
     });
-
     try {
       await _controller?.stopImageStream();
     } catch (_) {}
-
     await _initializeCamera();
   }
 
@@ -293,7 +303,6 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _processCameraImage(CameraImage image) async {
     if (_isDetecting) return;
     if (_isSwitching) return;
-
     _frameSkipCounter++;
     if (_frameSkipCounter % (kFrameSkip + 1) != 0) return;
 
@@ -312,7 +321,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
       final faces = await _faceDetector?.detectFacesFromCameraImage(image);
       final faceLandmarks = <Landmark>[];
-
       final frameW = image.width.toDouble();
       final frameH = image.height.toDouble();
 
@@ -333,7 +341,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
 
       final inferenceTime = stopwatch.elapsedMilliseconds;
-
       _framesSinceFps++;
       final now = DateTime.now().millisecondsSinceEpoch;
       if (now - _lastFpsTime > 1000) {
@@ -369,13 +376,16 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════
   // SIGN INFERENCE
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════
   void _updateSignBuffer() {
+    _bufferLen = _posBuffer.length;
     if (_lastHandLandmarks.isEmpty) {
       _posBuffer.clear();
       _handWasMoving = false;
+      _bufferState = 'no hand';
+      _bufferLen = 0;
       return;
     }
 
@@ -398,8 +408,12 @@ class _CameraScreenState extends State<CameraScreen> {
         motion += (frame[i] - prev[i]).abs();
       }
       motion /= kSignFeaturesPerFrame;
+      _lastMotion = motion;
 
-      if (motion > kMotionStart) _handWasMoving = true;
+      if (motion > kMotionStart) {
+        _handWasMoving = true;
+        _bufferState = 'moving';
+      }
 
       if (_handWasMoving && motion < kMotionEnd && _signCooldown == 0) {
         if (_posBuffer.length >= kSignBufferLen) {
@@ -408,12 +422,14 @@ class _CameraScreenState extends State<CameraScreen> {
         _posBuffer.clear();
         _handWasMoving = false;
         _signCooldown = kSignCooldownFrames;
+        _bufferState = 'triggered';
       }
     }
 
     _posBuffer.add(frame);
     if (_posBuffer.length > kSignBufferLen) _posBuffer.removeAt(0);
     if (_signCooldown > 0) _signCooldown--;
+    _bufferLen = _posBuffer.length;
   }
 
   void _runSignInference() {
@@ -435,20 +451,22 @@ class _CameraScreenState extends State<CameraScreen> {
     final result = _signService.predict(sequence);
     if (result == null) return;
 
-    final (label, conf, _) = result;
-    if (conf >= kSignMinConfidence) {
-      setState(() {
+    final (label, conf, probs) = result;
+    setState(() {
+      _lastSignProbs = probs;
+      _lastSignRawLabel = label;
+      _lastSignRawConf = conf;
+      if (conf >= kSignMinConfidence) {
         _lastSign = label;
         _lastSignConf = conf;
         _sentenceBuffer.add(label);
-      });
-      debugPrint('SIGN: $label (${(conf * 100).toStringAsFixed(1)}%)');
-    }
+      }
+    });
   }
 
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════
   // EMOTION INFERENCE
-  // ============================================================
+  // ═══════════════════════════════════════════════════════════
   void _runEmotionInference(CameraImage image, List<Landmark> faceLandmarks) {
     final preview = <Landmark>[];
     for (final lm in faceLandmarks) {
@@ -478,7 +496,8 @@ class _CameraScreenState extends State<CameraScreen> {
     final rowStride = yPlane.bytesPerRow;
     final pixelStride = yPlane.bytesPerPixel ?? 1;
 
-    final crop = List<double>.filled(48 * 48, 0.0);
+    // 1. Sample raw crop
+    final raw = List<double>.filled(48 * 48, 0.0);
     for (int yy = 0; yy < 48; yy++) {
       for (int xx = 0; xx < 48; xx++) {
         double px = x0 + (xx / 48.0) * (x1 - x0);
@@ -496,13 +515,44 @@ class _CameraScreenState extends State<CameraScreen> {
         int srcX = (rawX * image.width).toInt().clamp(0, image.width - 1);
         int srcY = (rawY * image.height).toInt().clamp(0, image.height - 1);
         int idx = srcY * rowStride + srcX * pixelStride;
-
         if (idx >= 0 && idx < bytes.length) {
-          crop[yy * 48 + xx] = bytes[idx] / 255.0;
+          raw[yy * 48 + xx] = bytes[idx] / 255.0;
         }
       }
     }
 
+    // 2. Apply chosen rotation
+    final crop = List<double>.filled(48 * 48, 0.0);
+    for (int y = 0; y < 48; y++) {
+      for (int x = 0; x < 48; x++) {
+        int srcIdx;
+        switch (_cropRotation) {
+          case 90:
+            srcIdx = x * 48 + (47 - y);
+            break;
+          case 180:
+            srcIdx = (47 - y) * 48 + (47 - x);
+            break;
+          case 270:
+            srcIdx = (47 - x) * 48 + y;
+            break;
+          default:
+            srcIdx = y * 48 + x;
+        }
+        crop[y * 48 + x] = raw[srcIdx];
+      }
+    }
+
+    // 3. Compute crop stats for debug
+    double mn = 1.0, mx = 0.0, sum = 0.0;
+    for (final v in crop) {
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+      sum += v;
+    }
+    final mean = sum / crop.length;
+
+    // 4. Build landmark vector
     final lmVec = <double>[];
     for (final lm in faceLandmarks) {
       lmVec.add(lm.x);
@@ -512,14 +562,19 @@ class _CameraScreenState extends State<CameraScreen> {
     final result = _emotionService.predict(crop, lmVec);
     if (result == null) return;
 
-    final (label, conf, _) = result;
-    if (conf >= kEmotionMinConfidence) {
-      setState(() {
+    final (label, conf, probs) = result;
+    setState(() {
+      _lastEmotionProbs = probs;
+      _lastEmotionRawLabel = label;
+      _lastEmotionRawConf = conf;
+      _lastCropMean = mean;
+      _lastCropMin = mn;
+      _lastCropMax = mx;
+      if (conf >= kEmotionMinConfidence) {
         _lastEmotion = label;
         _lastEmotionConf = conf;
-      });
-      debugPrint('EMOTION: $label (${(conf * 100).toStringAsFixed(1)}%)');
-    }
+      }
+    });
   }
 
   @override
@@ -536,7 +591,6 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   Widget build(BuildContext context) {
     final ctrl = _controller;
-
     if (ctrl == null || !ctrl.value.isInitialized) {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
@@ -547,7 +601,6 @@ class _CameraScreenState extends State<CameraScreen> {
       appBar: AppBar(
         title: Text('Plugin Test (${_isFrontCamera ? "Front" : "Back"})'),
         actions: [
-          // Resolution toggle
           TextButton.icon(
             onPressed: _isSwitching ? null : _cycleResolution,
             icon: Icon(resOption.icon, size: 18),
@@ -566,9 +619,12 @@ class _CameraScreenState extends State<CameraScreen> {
             onPressed: () => setState(() => _showOverlay = !_showOverlay),
           ),
           IconButton(
-            icon: const Icon(Icons.delete_sweep),
-            tooltip: 'Clear sentence',
-            onPressed: () => setState(() => _sentenceBuffer.clear()),
+            icon: Icon(
+              _showDebug ? Icons.bug_report : Icons.bug_report_outlined,
+              color: _showDebug ? Colors.orange : null,
+            ),
+            tooltip: 'Debug panel',
+            onPressed: () => setState(() => _showDebug = !_showDebug),
           ),
         ],
       ),
@@ -592,10 +648,10 @@ class _CameraScreenState extends State<CameraScreen> {
 
           Positioned(top: 20, left: 20, child: _buildStats()),
 
-          if (_modelsReady)
+          if (_modelsReady && !_showDebug)
             Positioned(top: 20, right: 20, child: _buildEmotionPanel()),
 
-          if (_modelsReady)
+          if (_modelsReady && !_showDebug)
             Positioned(
               bottom: 20,
               left: 20,
@@ -603,7 +659,7 @@ class _CameraScreenState extends State<CameraScreen> {
               child: _buildSignPanel(),
             ),
 
-          if (_handTooSmall && _lastHandSpan > 0)
+          if (_handTooSmall && _lastHandSpan > 0 && !_showDebug)
             Positioned(
               bottom: 220,
               left: 0,
@@ -649,6 +705,260 @@ class _CameraScreenState extends State<CameraScreen> {
                 ),
               ),
             ),
+
+          // ═══════════════════════════════════════════════════
+          // DEBUG PANEL
+          // ═══════════════════════════════════════════════════
+          if (_showDebug && _modelsReady)
+            Positioned(
+              bottom: 0,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.92),
+                  border: const Border(
+                    top: BorderSide(color: Colors.orangeAccent, width: 2),
+                  ),
+                ),
+                child: SafeArea(
+                  top: false,
+                  child: SingleChildScrollView(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // ═══ EMOTION ═══
+                        Row(
+                          children: [
+                            const Text(
+                              '🔴 EMOTION',
+                              style: TextStyle(
+                                color: Colors.orangeAccent,
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1.2,
+                              ),
+                            ),
+                            const Spacer(),
+                            TextButton(
+                              style: TextButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 2,
+                                ),
+                                minimumSize: Size.zero,
+                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                              ),
+                              onPressed: () => setState(() {
+                                _cropRotation = (_cropRotation + 90) % 360;
+                              }),
+                              child: Text(
+                                'Crop rot: $_cropRotation°  (tap to change)',
+                                style: const TextStyle(
+                                  color: Colors.yellowAccent,
+                                  fontSize: 11,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        _probRow('Positive', _lastEmotionProbs[0]),
+                        _probRow('Negative', _lastEmotionProbs[1]),
+                        _probRow('Surprise', _lastEmotionProbs[2]),
+                        _probRow('Neutral', _lastEmotionProbs[3]),
+                        Text(
+                          '→ raw: $_lastEmotionRawLabel '
+                          '(${(_lastEmotionRawConf * 100).toStringAsFixed(1)}%)  |  '
+                          'crop: ${_lastCropMin.toStringAsFixed(2)}–'
+                          '${_lastCropMax.toStringAsFixed(2)} '
+                          '(mean ${_lastCropMean.toStringAsFixed(2)})',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 10,
+                          ),
+                        ),
+                        const Divider(color: Colors.white24, height: 14),
+
+                        // ═══ SIGN ═══
+                        const Text(
+                          '🟢 SIGN',
+                          style: TextStyle(
+                            color: Colors.cyanAccent,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1.2,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Buffer: $_bufferLen/30   Motion: '
+                          '${_lastMotion.toStringAsFixed(4)}   '
+                          'Cooldown: $_signCooldown   State: $_bufferState',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 10,
+                          ),
+                        ),
+                        const SizedBox(height: 6),
+                        if (_lastSignProbs.isEmpty)
+                          const Text(
+                            '(no prediction yet)',
+                            style: TextStyle(
+                              color: Colors.white38,
+                              fontSize: 11,
+                            ),
+                          )
+                        else
+                          ..._topN(
+                            _lastSignProbs,
+                            5,
+                          ).map((e) => _probRowWithLabel(e.$1, e.$2)),
+                        Text(
+                          '→ raw: $_lastSignRawLabel '
+                          '(${(_lastSignRawConf * 100).toStringAsFixed(1)}%)',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 10,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Sentence: ${_sentenceBuffer.isEmpty ? "—" : _sentenceBuffer.join(" ")}',
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 11,
+                            fontStyle: FontStyle.italic,
+                          ),
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        if (_sentenceBuffer.isNotEmpty)
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: TextButton(
+                              onPressed: () =>
+                                  setState(() => _sentenceBuffer.clear()),
+                              child: const Text(
+                                'Clear sentence',
+                                style: TextStyle(fontSize: 11),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _probRow(String label, double p) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 60,
+            child: Text(
+              label,
+              style: const TextStyle(color: Colors.white, fontSize: 11),
+            ),
+          ),
+          SizedBox(
+            width: 40,
+            child: Text(
+              p.toStringAsFixed(3),
+              style: const TextStyle(color: Colors.white, fontSize: 11),
+            ),
+          ),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (_, c) => Stack(
+                children: [
+                  Container(
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: Colors.white12,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  Container(
+                    height: 8,
+                    width: c.maxWidth * p.clamp(0.0, 1.0),
+                    decoration: BoxDecoration(
+                      color: p > 0.4 ? Colors.green : Colors.white38,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<(String, double)> _topN(List<double> probs, int n) {
+    final indexed = List.generate(probs.length, (i) => (i, probs[i]));
+    indexed.sort((a, b) => b.$2.compareTo(a.$2));
+    return indexed.take(n).map((e) {
+      final label = e.$1 < _signService.labels.length
+          ? _signService.labels[e.$1]
+          : '?';
+      return (label, e.$2);
+    }).toList();
+  }
+
+  Widget _probRowWithLabel(String label, double p) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 110,
+            child: Text(
+              label.length > 16 ? label.substring(0, 16) : label,
+              style: const TextStyle(color: Colors.white, fontSize: 10),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          SizedBox(
+            width: 44,
+            child: Text(
+              p.toStringAsFixed(3),
+              style: const TextStyle(color: Colors.white, fontSize: 10),
+            ),
+          ),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (_, c) => Stack(
+                children: [
+                  Container(
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: Colors.white12,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  Container(
+                    height: 8,
+                    width: c.maxWidth * p.clamp(0.0, 1.0),
+                    decoration: BoxDecoration(
+                      color: p > 0.15 ? Colors.cyanAccent : Colors.white38,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -971,9 +1281,7 @@ class LandmarkPainter extends CustomPainter {
       for (final conn in _handConnections) {
         final a = pts[conn[0]];
         final b = pts[conn[1]];
-        if (a != null && b != null) {
-          canvas.drawLine(a, b, paintLine);
-        }
+        if (a != null && b != null) canvas.drawLine(a, b, paintLine);
       }
       for (int i = 0; i < pts.length; i++) {
         final p = pts[i];
