@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -11,9 +13,6 @@ import 'package:hand_landmarker/hand_landmarker.dart';
 import 'services/sign_model_service.dart';
 import 'services/emotion_model_service.dart';
 
-// ============================================================
-// TUNING FLAGS
-// ============================================================
 const bool kSwapDims = true;
 const bool kUseContain = false;
 const double kOffsetShiftX = 0.0;
@@ -28,7 +27,6 @@ const bool kShowDebugFrame = false;
 const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
-// Sign inference
 const int kSignBufferLen = 30;
 const int kSignFeaturesPerFrame = 126;
 const double kMotionStart = 0.02;
@@ -36,12 +34,10 @@ const double kMotionEnd = 0.008;
 const int kSignCooldownFrames = 30;
 const double kSignMinConfidence = 0.40;
 
-// Emotion inference
 const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.35;
 
 const int kDefaultResolutionIndex = 1;
-// ============================================================
 
 class Landmark {
   final double x, y, z;
@@ -88,7 +84,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Plugin Test — Debug',
+      title: 'Plugin Test',
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
@@ -138,7 +134,6 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // Sign state
   final List<List<double>> _posBuffer = [];
   bool _handWasMoving = false;
   int _signCooldown = 0;
@@ -146,34 +141,17 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
 
-  // Emotion state
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
   double _lastEmotionConf = 0.0;
 
-  // ═══════════════════════════════════════════════════════════
-  // DEBUG STATE
-  // ═══════════════════════════════════════════════════════════
-  bool _showDebug = false;
-  int _cropRotation = 0; // 0, 90, 180, 270
-
-  // Emotion raw
+  // Always-visible debug data
+  int _cropRotation = 0;
   List<double> _lastEmotionProbs = [0, 0, 0, 0];
-  String _lastEmotionRawLabel = '—';
-  double _lastEmotionRawConf = 0.0;
-  double _lastCropMean = 0.0;
-  double _lastCropMin = 0.0;
-  double _lastCropMax = 0.0;
-
-  // Sign raw
   List<double> _lastSignProbs = [];
-  String _lastSignRawLabel = '—';
-  double _lastSignRawConf = 0.0;
-  int _bufferLen = 0;
   double _lastMotion = 0.0;
   String _bufferState = 'idle';
-
-  // ═══════════════════════════════════════════════════════════
+  Uint8List? _lastCropPng;
 
   @override
   void initState() {
@@ -366,7 +344,7 @@ class _CameraScreenState extends State<CameraScreen> {
       if (_modelsReady && faceLandmarks.length >= 400) {
         _emotionFrameCounter++;
         if (_emotionFrameCounter % kEmotionEveryNFrames == 0) {
-          _runEmotionInference(image, faceLandmarks);
+          await _runEmotionInference(image, faceLandmarks);
         }
       }
     } catch (e, st) {
@@ -376,16 +354,11 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // SIGN INFERENCE
-  // ═══════════════════════════════════════════════════════════
   void _updateSignBuffer() {
-    _bufferLen = _posBuffer.length;
     if (_lastHandLandmarks.isEmpty) {
       _posBuffer.clear();
       _handWasMoving = false;
       _bufferState = 'no hand';
-      _bufferLen = 0;
       return;
     }
 
@@ -429,7 +402,6 @@ class _CameraScreenState extends State<CameraScreen> {
     _posBuffer.add(frame);
     if (_posBuffer.length > kSignBufferLen) _posBuffer.removeAt(0);
     if (_signCooldown > 0) _signCooldown--;
-    _bufferLen = _posBuffer.length;
   }
 
   void _runSignInference() {
@@ -454,8 +426,6 @@ class _CameraScreenState extends State<CameraScreen> {
     final (label, conf, probs) = result;
     setState(() {
       _lastSignProbs = probs;
-      _lastSignRawLabel = label;
-      _lastSignRawConf = conf;
       if (conf >= kSignMinConfidence) {
         _lastSign = label;
         _lastSignConf = conf;
@@ -464,10 +434,10 @@ class _CameraScreenState extends State<CameraScreen> {
     });
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // EMOTION INFERENCE
-  // ═══════════════════════════════════════════════════════════
-  void _runEmotionInference(CameraImage image, List<Landmark> faceLandmarks) {
+  Future<void> _runEmotionInference(
+    CameraImage image,
+    List<Landmark> faceLandmarks,
+  ) async {
     final preview = <Landmark>[];
     for (final lm in faceLandmarks) {
       if (_isFrontCamera) {
@@ -496,7 +466,6 @@ class _CameraScreenState extends State<CameraScreen> {
     final rowStride = yPlane.bytesPerRow;
     final pixelStride = yPlane.bytesPerPixel ?? 1;
 
-    // 1. Sample raw crop
     final raw = List<double>.filled(48 * 48, 0.0);
     for (int yy = 0; yy < 48; yy++) {
       for (int xx = 0; xx < 48; xx++) {
@@ -521,7 +490,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    // 2. Apply chosen rotation
     final crop = List<double>.filled(48 * 48, 0.0);
     for (int y = 0; y < 48; y++) {
       for (int x = 0; x < 48; x++) {
@@ -543,16 +511,8 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    // 3. Compute crop stats for debug
-    double mn = 1.0, mx = 0.0, sum = 0.0;
-    for (final v in crop) {
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
-      sum += v;
-    }
-    final mean = sum / crop.length;
+    final png = await _cropToPng(crop);
 
-    // 4. Build landmark vector
     final lmVec = <double>[];
     for (final lm in faceLandmarks) {
       lmVec.add(lm.x);
@@ -565,16 +525,34 @@ class _CameraScreenState extends State<CameraScreen> {
     final (label, conf, probs) = result;
     setState(() {
       _lastEmotionProbs = probs;
-      _lastEmotionRawLabel = label;
-      _lastEmotionRawConf = conf;
-      _lastCropMean = mean;
-      _lastCropMin = mn;
-      _lastCropMax = mx;
+      _lastCropPng = png;
       if (conf >= kEmotionMinConfidence) {
         _lastEmotion = label;
         _lastEmotionConf = conf;
       }
     });
+  }
+
+  Future<Uint8List> _cropToPng(List<double> crop) async {
+    final rgba = Uint8List(48 * 48 * 4);
+    for (int i = 0; i < 48 * 48; i++) {
+      final v = (crop[i] * 255).clamp(0, 255).toInt();
+      rgba[i * 4 + 0] = v;
+      rgba[i * 4 + 1] = v;
+      rgba[i * 4 + 2] = v;
+      rgba[i * 4 + 3] = 255;
+    }
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgba,
+      48,
+      48,
+      ui.PixelFormat.rgba8888,
+      (img) => completer.complete(img),
+    );
+    final img = await completer.future;
+    final bd = await img.toByteData(format: ui.ImageByteFormat.png);
+    return bd!.buffer.asUint8List();
   }
 
   @override
@@ -595,42 +573,42 @@ class _CameraScreenState extends State<CameraScreen> {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
-    final resOption = kResolutionOptions[_resIndex];
-
     return Scaffold(
       appBar: AppBar(
-        title: Text('Plugin Test (${_isFrontCamera ? "Front" : "Back"})'),
+        title: const Text('Plugin Test', style: TextStyle(fontSize: 16)),
         actions: [
-          TextButton.icon(
-            onPressed: _isSwitching ? null : _cycleResolution,
-            icon: Icon(resOption.icon, size: 18),
-            label: Text(
-              resOption.label,
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-            style: TextButton.styleFrom(foregroundColor: Colors.black87),
-          ),
           IconButton(
             icon: const Icon(Icons.cameraswitch),
+            tooltip: 'Flip camera',
             onPressed: _isSwitching ? null : _switchCamera,
           ),
           IconButton(
             icon: Icon(_showOverlay ? Icons.visibility : Icons.visibility_off),
+            tooltip: 'Toggle landmarks',
             onPressed: () => setState(() => _showOverlay = !_showOverlay),
           ),
           IconButton(
-            icon: Icon(
-              _showDebug ? Icons.bug_report : Icons.bug_report_outlined,
-              color: _showDebug ? Colors.orange : null,
-            ),
-            tooltip: 'Debug panel',
-            onPressed: () => setState(() => _showDebug = !_showDebug),
+            icon: const Icon(Icons.delete_sweep),
+            tooltip: 'Clear sentence',
+            onPressed: () => setState(() => _sentenceBuffer.clear()),
           ),
         ],
       ),
       body: Stack(
         children: [
-          Positioned.fill(child: CameraPreview(ctrl)),
+          Positioned.fill(
+            child: ClipRect(
+              child: FittedBox(
+                fit: BoxFit.cover,
+                clipBehavior: Clip.hardEdge,
+                child: SizedBox(
+                  width: ctrl.value.previewSize!.height,
+                  height: ctrl.value.previewSize!.width,
+                  child: CameraPreview(ctrl),
+                ),
+              ),
+            ),
+          ),
 
           if (_showOverlay && _lastResult != null)
             Positioned.fill(
@@ -648,10 +626,11 @@ class _CameraScreenState extends State<CameraScreen> {
 
           Positioned(top: 20, left: 20, child: _buildStats()),
 
-          if (_modelsReady && !_showDebug)
-            Positioned(top: 20, right: 20, child: _buildEmotionPanel()),
+          // ── ALWAYS-VISIBLE DEBUG PANEL (right side, middle) ──
+          if (_modelsReady)
+            Positioned(top: 20, right: 20, child: _buildDebugStrip()),
 
-          if (_modelsReady && !_showDebug)
+          if (_modelsReady)
             Positioned(
               bottom: 20,
               left: 20,
@@ -659,7 +638,7 @@ class _CameraScreenState extends State<CameraScreen> {
               child: _buildSignPanel(),
             ),
 
-          if (_handTooSmall && _lastHandSpan > 0 && !_showDebug)
+          if (_handTooSmall && _lastHandSpan > 0)
             Positioned(
               bottom: 220,
               left: 0,
@@ -705,176 +684,193 @@ class _CameraScreenState extends State<CameraScreen> {
                 ),
               ),
             ),
-
-          // ═══════════════════════════════════════════════════
-          // DEBUG PANEL
-          // ═══════════════════════════════════════════════════
-          if (_showDebug && _modelsReady)
-            Positioned(
-              bottom: 0,
-              left: 0,
-              right: 0,
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.92),
-                  border: const Border(
-                    top: BorderSide(color: Colors.orangeAccent, width: 2),
-                  ),
-                ),
-                child: SafeArea(
-                  top: false,
-                  child: SingleChildScrollView(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        // ═══ EMOTION ═══
-                        Row(
-                          children: [
-                            const Text(
-                              '🔴 EMOTION',
-                              style: TextStyle(
-                                color: Colors.orangeAccent,
-                                fontSize: 12,
-                                fontWeight: FontWeight.bold,
-                                letterSpacing: 1.2,
-                              ),
-                            ),
-                            const Spacer(),
-                            TextButton(
-                              style: TextButton.styleFrom(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 2,
-                                ),
-                                minimumSize: Size.zero,
-                                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                              ),
-                              onPressed: () => setState(() {
-                                _cropRotation = (_cropRotation + 90) % 360;
-                              }),
-                              child: Text(
-                                'Crop rot: $_cropRotation°  (tap to change)',
-                                style: const TextStyle(
-                                  color: Colors.yellowAccent,
-                                  fontSize: 11,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 4),
-                        _probRow('Positive', _lastEmotionProbs[0]),
-                        _probRow('Negative', _lastEmotionProbs[1]),
-                        _probRow('Surprise', _lastEmotionProbs[2]),
-                        _probRow('Neutral', _lastEmotionProbs[3]),
-                        Text(
-                          '→ raw: $_lastEmotionRawLabel '
-                          '(${(_lastEmotionRawConf * 100).toStringAsFixed(1)}%)  |  '
-                          'crop: ${_lastCropMin.toStringAsFixed(2)}–'
-                          '${_lastCropMax.toStringAsFixed(2)} '
-                          '(mean ${_lastCropMean.toStringAsFixed(2)})',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 10,
-                          ),
-                        ),
-                        const Divider(color: Colors.white24, height: 14),
-
-                        // ═══ SIGN ═══
-                        const Text(
-                          '🟢 SIGN',
-                          style: TextStyle(
-                            color: Colors.cyanAccent,
-                            fontSize: 12,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 1.2,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Buffer: $_bufferLen/30   Motion: '
-                          '${_lastMotion.toStringAsFixed(4)}   '
-                          'Cooldown: $_signCooldown   State: $_bufferState',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 10,
-                          ),
-                        ),
-                        const SizedBox(height: 6),
-                        if (_lastSignProbs.isEmpty)
-                          const Text(
-                            '(no prediction yet)',
-                            style: TextStyle(
-                              color: Colors.white38,
-                              fontSize: 11,
-                            ),
-                          )
-                        else
-                          ..._topN(
-                            _lastSignProbs,
-                            5,
-                          ).map((e) => _probRowWithLabel(e.$1, e.$2)),
-                        Text(
-                          '→ raw: $_lastSignRawLabel '
-                          '(${(_lastSignRawConf * 100).toStringAsFixed(1)}%)',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 10,
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          'Sentence: ${_sentenceBuffer.isEmpty ? "—" : _sentenceBuffer.join(" ")}',
-                          style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 11,
-                            fontStyle: FontStyle.italic,
-                          ),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        if (_sentenceBuffer.isNotEmpty)
-                          Align(
-                            alignment: Alignment.centerRight,
-                            child: TextButton(
-                              onPressed: () =>
-                                  setState(() => _sentenceBuffer.clear()),
-                              child: const Text(
-                                'Clear sentence',
-                                style: TextStyle(fontSize: 11),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
         ],
       ),
     );
   }
 
-  Widget _probRow(String label, double p) {
+  // ═══════════════════════════════════════════════════════════
+  // ALWAYS-VISIBLE DEBUG STRIP
+  // ═══════════════════════════════════════════════════════════
+  Widget _buildDebugStrip() {
+    return Container(
+      width: 168,
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.82),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.orangeAccent, width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ── Crop preview (the exact 48×48 the model sees) ──
+          const Text(
+            'CROP',
+            style: TextStyle(
+              color: Colors.orangeAccent,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.white24, width: 1),
+                  borderRadius: BorderRadius.circular(4),
+                  color: Colors.black,
+                ),
+                child: _lastCropPng == null
+                    ? const Center(
+                        child: Text(
+                          '—',
+                          style: TextStyle(color: Colors.white38, fontSize: 9),
+                        ),
+                      )
+                    : Image.memory(
+                        _lastCropPng!,
+                        width: 60,
+                        height: 60,
+                        fit: BoxFit.contain,
+                        filterQuality: FilterQuality.none,
+                        gaplessPlayback: true,
+                      ),
+              ),
+              const SizedBox(width: 6),
+              // Crop rotation button
+              Expanded(
+                child: GestureDetector(
+                  onTap: () {
+                    setState(() {
+                      _cropRotation = (_cropRotation + 90) % 360;
+                    });
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 4,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withOpacity(0.12),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.rotate_right,
+                          size: 14,
+                          color: Colors.yellowAccent,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          '${_cropRotation}°',
+                          style: const TextStyle(
+                            color: Colors.yellowAccent,
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Divider(color: Colors.white24, height: 1),
+          const SizedBox(height: 6),
+
+          // ── Emotion probs ──
+          const Text(
+            'EMOTION',
+            style: TextStyle(
+              color: Colors.pinkAccent,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 3),
+          _tinyProb('Pos', _lastEmotionProbs[0]),
+          _tinyProb('Neg', _lastEmotionProbs[1]),
+          _tinyProb('Sur', _lastEmotionProbs[2]),
+          _tinyProb('Neu', _lastEmotionProbs[3]),
+          const SizedBox(height: 4),
+          Text(
+            '→ $_lastEmotion $_lastEmotionConf'.replaceAll(
+              RegExp(r'0\.\d+'),
+              (_lastEmotionConf * 100).toStringAsFixed(0),
+            ),
+            style: const TextStyle(color: Colors.white70, fontSize: 9),
+          ),
+          const Divider(color: Colors.white24, height: 8),
+
+          // ── Sign status ──
+          const Text(
+            'SIGN',
+            style: TextStyle(
+              color: Colors.cyanAccent,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 3),
+          Text(
+            'buf ${_posBuffer.length}/30',
+            style: const TextStyle(color: Colors.white70, fontSize: 9),
+          ),
+          Text(
+            'mv ${_lastMotion.toStringAsFixed(3)}',
+            style: TextStyle(
+              color: _lastMotion > kMotionStart ? Colors.green : Colors.white70,
+              fontSize: 9,
+            ),
+          ),
+          Text(
+            _bufferState,
+            style: const TextStyle(color: Colors.white70, fontSize: 9),
+          ),
+          const SizedBox(height: 4),
+          if (_lastSignProbs.isNotEmpty)
+            ..._topN(_lastSignProbs, 3).map((e) => _tinyTopLabel(e.$1, e.$2)),
+          const SizedBox(height: 2),
+          Text(
+            '→ $_lastSign (${(_lastSignConf * 100).toStringAsFixed(0)}%)',
+            style: const TextStyle(color: Colors.white70, fontSize: 9),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tinyProb(String label, double p) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 1),
       child: Row(
         children: [
           SizedBox(
-            width: 60,
+            width: 24,
             child: Text(
               label,
-              style: const TextStyle(color: Colors.white, fontSize: 11),
+              style: const TextStyle(color: Colors.white, fontSize: 9),
             ),
           ),
           SizedBox(
-            width: 40,
+            width: 28,
             child: Text(
-              p.toStringAsFixed(3),
-              style: const TextStyle(color: Colors.white, fontSize: 11),
+              p.toStringAsFixed(2),
+              style: const TextStyle(color: Colors.white, fontSize: 9),
             ),
           ),
           Expanded(
@@ -882,18 +878,18 @@ class _CameraScreenState extends State<CameraScreen> {
               builder: (_, c) => Stack(
                 children: [
                   Container(
-                    height: 8,
+                    height: 5,
                     decoration: BoxDecoration(
                       color: Colors.white12,
-                      borderRadius: BorderRadius.circular(4),
+                      borderRadius: BorderRadius.circular(3),
                     ),
                   ),
                   Container(
-                    height: 8,
+                    height: 5,
                     width: c.maxWidth * p.clamp(0.0, 1.0),
                     decoration: BoxDecoration(
                       color: p > 0.4 ? Colors.green : Colors.white38,
-                      borderRadius: BorderRadius.circular(4),
+                      borderRadius: BorderRadius.circular(3),
                     ),
                   ),
                 ],
@@ -916,47 +912,24 @@ class _CameraScreenState extends State<CameraScreen> {
     }).toList();
   }
 
-  Widget _probRowWithLabel(String label, double p) {
+  Widget _tinyTopLabel(String label, double p) {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 1),
       child: Row(
         children: [
-          SizedBox(
-            width: 110,
+          Expanded(
             child: Text(
-              label.length > 16 ? label.substring(0, 16) : label,
-              style: const TextStyle(color: Colors.white, fontSize: 10),
+              label.length > 8 ? label.substring(0, 8) : label,
+              style: const TextStyle(color: Colors.white, fontSize: 9),
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          SizedBox(
-            width: 44,
-            child: Text(
-              p.toStringAsFixed(3),
-              style: const TextStyle(color: Colors.white, fontSize: 10),
-            ),
-          ),
-          Expanded(
-            child: LayoutBuilder(
-              builder: (_, c) => Stack(
-                children: [
-                  Container(
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: Colors.white12,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                  ),
-                  Container(
-                    height: 8,
-                    width: c.maxWidth * p.clamp(0.0, 1.0),
-                    decoration: BoxDecoration(
-                      color: p > 0.15 ? Colors.cyanAccent : Colors.white38,
-                      borderRadius: BorderRadius.circular(4),
-                    ),
-                  ),
-                ],
-              ),
+          Text(
+            p.toStringAsFixed(2),
+            style: TextStyle(
+              color: p > 0.15 ? Colors.cyanAccent : Colors.white38,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
             ),
           ),
         ],
@@ -992,11 +965,34 @@ class _CameraScreenState extends State<CameraScreen> {
             'Latency: ${_lastResult?.inferenceTimeMs ?? 0} ms',
             style: const TextStyle(color: Colors.white, fontSize: 12),
           ),
-          const SizedBox(height: 4),
-          Text(
-            'Res: ${resOption.label}',
-            style: const TextStyle(color: Colors.cyan, fontSize: 11),
+          const SizedBox(height: 6),
+          InkWell(
+            onTap: _isSwitching ? null : _cycleResolution,
+            borderRadius: BorderRadius.circular(20),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(resOption.icon, size: 14, color: Colors.cyanAccent),
+                  const SizedBox(width: 4),
+                  Text(
+                    resOption.label,
+                    style: const TextStyle(
+                      color: Colors.cyanAccent,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
+          const SizedBox(height: 4),
           Text(
             'Preview: $_previewSize',
             style: const TextStyle(color: Colors.yellow, fontSize: 10),
@@ -1011,41 +1007,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Widget _buildEmotionPanel() {
-    final icons = {
-      'Positive': '😊',
-      'Negative': '😢',
-      'Surprise': '😲',
-      'Neutral': '😐',
-    };
-    final icon = icons[_lastEmotion] ?? '❓';
-    final confPct = (_lastEmotionConf * 100).toStringAsFixed(0);
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.75),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.pinkAccent, width: 2),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text(icon, style: const TextStyle(fontSize: 30)),
-          Text(
-            _lastEmotion,
-            style: const TextStyle(
-              color: Colors.white,
-              fontWeight: FontWeight.bold,
-              fontSize: 13,
-            ),
-          ),
-          Text(
-            '$confPct%',
-            style: const TextStyle(color: Colors.pinkAccent, fontSize: 11),
-          ),
-        ],
-      ),
-    );
+    return const SizedBox.shrink();
   }
 
   Widget _buildSignPanel() {
