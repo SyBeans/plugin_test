@@ -28,14 +28,30 @@ const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
 // ═══════════════════════════════════════════════════════════
-// STREAMING SIGN MODE
+// SIGN — NATURAL CONTINUOUS SIGNING
+// Motion gate only suppresses STILL hands. While actively
+// signing, predictions run continuously and new signs commit
+// as soon as their labels stabilize in a rolling vote window.
 // ═══════════════════════════════════════════════════════════
-const int kSignBufferLen = 30;
+const int kSignBufferLen = 30; // model input window
+const int kSignKeepFrames = 40; // rolling buffer cap
 const int kSignFeaturesPerFrame = 126;
-const int kSignPredictEveryNFrames = 5;
-const int kSmoothingWindow = 5;
-const int kStableVoteCount = 3;
-const double kSignMinConfidence = 0.40;
+const double kSignMinConfidence = 0.50;
+
+// Motion gate
+const int kSignMotionHistoryLen = 10;
+const double kSignMotionStartThreshold = 0.015;
+
+// Inference cadence while active
+const int kSignPredictEveryNFrames = 3;
+
+// Label stabilization
+const int kSignVoteWindow = 6;
+const int kSignStableVoteCount = 4;
+const int kSignCooldownFrames = 8;
+
+// Hand dropout tolerance
+const int kSignHandDropDelay = 6;
 
 // ═══════════════════════════════════════════════════════════
 // EMOTION
@@ -44,9 +60,6 @@ const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.40;
 const Duration kEmotionCropTimeout = Duration(milliseconds: 400);
 
-// Post-processing (ported from test_webcam_v11_8.py)
-// Class order: [Positive, Negative, Surprise, Neutral]
-// Down-weight Negative, up-weight Neutral to counter FER2025 class imbalance.
 const List<double> kEmotionClassWeights = [1.0, 0.50, 1.0, 1.50];
 const int kEmotionSmoothingLen = 8;
 
@@ -147,14 +160,20 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // ── Streaming sign state ──
+  // ── Sign: continuous streaming state ──
   final List<List<double>> _posBuffer = [];
+  List<double>? _lastSignPositions;
+  final List<double> _signMotionHistory = [];
+  bool _signActive = false;
+  int _signNoHandFrames = 0;
   int _signPredictCounter = 0;
-  final List<String> _recentSignPredictions = [];
+  int _signCooldown = 0;
+  final List<String> _signVoteBuffer = [];
+
   String _lastSign = '—';
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
-  String _bufferState = 'no hand';
+  String _bufferState = 'idle';
 
   // ── Emotion state ──
   int _emotionFrameCounter = 0;
@@ -271,8 +290,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _isSwitching = true;
       _lastResult = null;
       _lastHandLandmarks = [];
-      _posBuffer.clear();
-      _recentSignPredictions.clear();
+      _resetSignStream();
       _emotionVoteBuffer.clear();
       _resIndex = (_resIndex + 1) % kResolutionOptions.length;
     });
@@ -288,8 +306,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _isSwitching = true;
       _lastResult = null;
       _lastHandLandmarks = [];
-      _posBuffer.clear();
-      _recentSignPredictions.clear();
+      _resetSignStream();
       _emotionVoteBuffer.clear();
     });
     try {
@@ -361,7 +378,7 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
 
-      if (_modelsReady) _updateSignBuffer();
+      if (_modelsReady) _updateSignStream();
 
       if (_modelsReady && faceLandmarks.length >= 400 && !_emotionInFlight) {
         _emotionFrameCounter++;
@@ -381,16 +398,22 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // STREAMING SIGN — sliding window + temporal smoothing
+  // SIGN — CONTINUOUS NATURAL STREAMING
   // ═══════════════════════════════════════════════════════════
-  void _updateSignBuffer() {
+  void _updateSignStream() {
+    // ── Hand absent ──
     if (_lastHandLandmarks.isEmpty) {
-      _posBuffer.clear();
-      _recentSignPredictions.clear();
-      _bufferState = 'no hand';
+      _signNoHandFrames++;
+      if (_signNoHandFrames >= kSignHandDropDelay) {
+        _signActive = false;
+        _signVoteBuffer.clear();
+        _bufferState = 'idle (no hand)';
+      }
       return;
     }
+    _signNoHandFrames = 0;
 
+    // ── Build 126-feature frame ──
     final frame = List<double>.filled(kSignFeaturesPerFrame, 0.0);
     final handCount = _lastHandLandmarks.length ~/ 21;
     for (int h = 0; h < math.min(handCount, 2); h++) {
@@ -403,44 +426,79 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    _posBuffer.add(frame);
-    if (_posBuffer.length > kSignBufferLen) _posBuffer.removeAt(0);
-
-    if (_posBuffer.length >= 2) {
-      final prev = _posBuffer[_posBuffer.length - 2];
-      double motion = 0.0;
+    // ── Motion (Euclidean norm vs previous frame) ──
+    double motion = 0.0;
+    if (_lastSignPositions != null) {
+      double sumSq = 0.0;
       for (int i = 0; i < kSignFeaturesPerFrame; i++) {
-        motion += (frame[i] - prev[i]).abs();
+        final d = frame[i] - _lastSignPositions![i];
+        sumSq += d * d;
       }
-      _lastMotion = motion / kSignFeaturesPerFrame;
+      motion = math.sqrt(sumSq);
     }
+    _lastMotion = motion;
+    _lastSignPositions = frame;
+
+    _signMotionHistory.add(motion);
+    if (_signMotionHistory.length > kSignMotionHistoryLen) {
+      _signMotionHistory.removeAt(0);
+    }
+
+    // ── Active if any recent frame had motion ──
+    final anyMotion = _signMotionHistory.any(
+      (m) => m > kSignMotionStartThreshold,
+    );
+
+    if (!anyMotion) {
+      _signActive = false;
+      _signVoteBuffer.clear();
+      _bufferState = 'idle (still)';
+      return;
+    }
+
+    _signActive = true;
+
+    // ── Push to rolling buffer ──
+    _posBuffer.add(frame);
+    if (_posBuffer.length > kSignKeepFrames) _posBuffer.removeAt(0);
 
     if (_posBuffer.length < kSignBufferLen) {
       _bufferState = 'filling ${_posBuffer.length}/30';
       return;
     }
 
-    _signPredictCounter++;
-    if (_signPredictCounter % kSignPredictEveryNFrames != 0) {
-      _bufferState = 'streaming';
+    // ── Cooldown after a commit ──
+    if (_signCooldown > 0) {
+      _signCooldown--;
+      _bufferState = 'cooldown $_signCooldown';
       return;
     }
 
-    _bufferState = 'streaming';
-    _runSignInference();
+    // ── Predict every N active frames ──
+    _signPredictCounter++;
+    if (_signPredictCounter % kSignPredictEveryNFrames != 0) {
+      _bufferState = 'active buf=${_posBuffer.length}';
+      return;
+    }
+
+    _bufferState = 'active (predict)';
+    _runContinuousInference();
   }
 
-  void _runSignInference() {
+  void _runContinuousInference() {
+    // Build (30, 252) from the last kSignBufferLen frames
+    final int n = _posBuffer.length;
+    final List<List<double>> window = _posBuffer.sublist(n - kSignBufferLen);
+
     final sequence = <List<double>>[];
     for (int i = 0; i < kSignBufferLen; i++) {
       final frame = List<double>.filled(252, 0.0);
       for (int j = 0; j < kSignFeaturesPerFrame; j++) {
-        frame[j] = _posBuffer[i][j];
+        frame[j] = window[i][j];
       }
       if (i > 0) {
         for (int j = 0; j < kSignFeaturesPerFrame; j++) {
-          frame[kSignFeaturesPerFrame + j] =
-              _posBuffer[i][j] - _posBuffer[i - 1][j];
+          frame[kSignFeaturesPerFrame + j] = window[i][j] - window[i - 1][j];
         }
       }
       sequence.add(frame);
@@ -456,35 +514,51 @@ class _CameraScreenState extends State<CameraScreen> {
       _lastSignConf = conf;
     });
 
-    if (conf >= kSignMinConfidence) {
-      _recentSignPredictions.add(label);
-      if (_recentSignPredictions.length > kSmoothingWindow) {
-        _recentSignPredictions.removeAt(0);
-      }
-    }
+    if (conf < kSignMinConfidence) return;
 
-    if (_recentSignPredictions.isEmpty) return;
+    // ── Vote window ──
+    _signVoteBuffer.add(label);
+    if (_signVoteBuffer.length > kSignVoteWindow) {
+      _signVoteBuffer.removeAt(0);
+    }
+    if (_signVoteBuffer.length < kSignVoteWindow) return;
 
     final counts = <String, int>{};
-    for (final p in _recentSignPredictions) {
-      counts[p] = (counts[p] ?? 0) + 1;
+    for (final l in _signVoteBuffer) {
+      counts[l] = (counts[l] ?? 0) + 1;
     }
-    final smoothed = counts.entries
-        .reduce((a, b) => a.value >= b.value ? a : b)
-        .key;
+    final winner = counts.entries.reduce((a, b) => a.value >= b.value ? a : b);
 
-    if ((counts[smoothed] ?? 0) >= kStableVoteCount) {
-      if (_sentenceBuffer.isEmpty || _sentenceBuffer.last != smoothed) {
-        setState(() {
-          _sentenceBuffer.add(smoothed);
-          _recentSignPredictions.clear();
-        });
-      }
+    if (winner.value < kSignStableVoteCount) return;
+
+    // Only commit if different from last committed word
+    if (_sentenceBuffer.isEmpty || _sentenceBuffer.last != winner.key) {
+      debugPrint(
+        'SIGN: committed ${winner.key} '
+        '(${winner.value}/$kSignVoteWindow votes)',
+      );
+      setState(() {
+        _sentenceBuffer.add(winner.key);
+        _signVoteBuffer.clear();
+        _signCooldown = kSignCooldownFrames;
+      });
     }
   }
 
+  void _resetSignStream() {
+    _posBuffer.clear();
+    _lastSignPositions = null;
+    _signMotionHistory.clear();
+    _signNoHandFrames = 0;
+    _signPredictCounter = 0;
+    _signCooldown = 0;
+    _signActive = false;
+    _signVoteBuffer.clear();
+    _bufferState = 'idle';
+  }
+
   // ═══════════════════════════════════════════════════════════
-  // EMOTION
+  // EMOTION (unchanged)
   // ═══════════════════════════════════════════════════════════
   Future<void> _runEmotionInference(
     CameraImage image,
@@ -492,7 +566,6 @@ class _CameraScreenState extends State<CameraScreen> {
   ) async {
     String? localError;
     try {
-      // 1) Landmarks → preview space (matches crop frame)
       final preview = <Landmark>[];
       for (final lm in faceLandmarks) {
         if (_isFrontCamera) {
@@ -516,7 +589,6 @@ class _CameraScreenState extends State<CameraScreen> {
       final double y0 = (cy - size * 0.65).clamp(0.0, 1.0);
       final double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
 
-      // 2) Sample Y plane → 48x48 grayscale
       final yPlane = image.planes[0];
       final bytes = yPlane.bytes;
       final int rowStride = yPlane.bytesPerRow;
@@ -562,7 +634,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
       final rawMean = rawSum / raw.length;
 
-      // 3) Rotate crop if user picked a rotation
       final crop = List<double>.filled(48 * 48, 0.0);
       for (int y = 0; y < 48; y++) {
         for (int x = 0; x < 48; x++) {
@@ -584,7 +655,6 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       }
 
-      // 4) Landmark vector — SAME frame as the crop (preview space)
       final lmVec = <double>[];
       for (final lm in preview) {
         lmVec.add(lm.x);
@@ -607,7 +677,6 @@ class _CameraScreenState extends State<CameraScreen> {
         'mean=${lmMean.toStringAsFixed(3)}',
       );
 
-      // 5) Inference + post-processing
       final result = _emotionService.predict(crop, lmVec);
       if (result == null) {
         localError = 'predict → null';
@@ -615,7 +684,6 @@ class _CameraScreenState extends State<CameraScreen> {
       } else {
         final (_, _, rawProbs) = result;
 
-        // 5a) Class weights → re-normalize
         final weighted = List<double>.filled(4, 0.0);
         double wSum = 0.0;
         for (int i = 0; i < 4; i++) {
@@ -628,7 +696,6 @@ class _CameraScreenState extends State<CameraScreen> {
           }
         }
 
-        // 5b) Current frame's top class
         int frameIdx = 0;
         double frameTop = weighted[0];
         for (int i = 1; i < 4; i++) {
@@ -639,7 +706,6 @@ class _CameraScreenState extends State<CameraScreen> {
         }
         final frameLabel = EmotionModelService.classNames[frameIdx];
 
-        // 5c) Push into vote buffer if above threshold
         if (frameTop >= kEmotionMinConfidence) {
           _emotionVoteBuffer.add(frameLabel);
           if (_emotionVoteBuffer.length > kEmotionSmoothingLen) {
@@ -647,7 +713,6 @@ class _CameraScreenState extends State<CameraScreen> {
           }
         }
 
-        // 5d) Majority vote → smoothed label
         String smoothedLabel = frameLabel;
         double smoothedConf = frameTop;
         if (_emotionVoteBuffer.isNotEmpty) {
@@ -676,7 +741,6 @@ class _CameraScreenState extends State<CameraScreen> {
           'votes=${_emotionVoteBuffer.length}',
         );
 
-        // 6) Crop PNG for debug strip
         Uint8List? png;
         try {
           png = await _cropToPng(crop).timeout(kEmotionCropTimeout);
@@ -774,7 +838,7 @@ class _CameraScreenState extends State<CameraScreen> {
             tooltip: 'Clear sentence',
             onPressed: () => setState(() {
               _sentenceBuffer.clear();
-              _recentSignPredictions.clear();
+              _resetSignStream();
               _emotionVoteBuffer.clear();
             }),
           ),
@@ -874,9 +938,6 @@ class _CameraScreenState extends State<CameraScreen> {
     );
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // DEBUG STRIP (top-right)
-  // ═══════════════════════════════════════════════════════════
   Widget _buildDebugStrip() {
     return Container(
       width: 178,
@@ -1010,7 +1071,7 @@ class _CameraScreenState extends State<CameraScreen> {
           const Divider(color: Colors.white24, height: 8),
 
           const Text(
-            'SIGN (STREAM)',
+            'SIGN (NATURAL)',
             style: TextStyle(
               color: Colors.cyanAccent,
               fontSize: 9,
@@ -1020,11 +1081,12 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
           const SizedBox(height: 3),
           Text(
-            'buf ${_posBuffer.length}/30',
+            _bufferState,
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           Text(
-            _bufferState,
+            'motion ${_lastMotion.toStringAsFixed(3)}  '
+            'votes ${_signVoteBuffer.length}/$kSignVoteWindow',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           const SizedBox(height: 4),
