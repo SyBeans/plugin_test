@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -39,8 +41,14 @@ const double kSignMinConfidence = 0.40;
 // EMOTION
 // ═══════════════════════════════════════════════════════════
 const int kEmotionEveryNFrames = 5;
-const double kEmotionMinConfidence = 0.35;
+const double kEmotionMinConfidence = 0.40;
 const Duration kEmotionCropTimeout = Duration(milliseconds: 400);
+
+// Post-processing (ported from test_webcam_v11_8.py)
+// Class order: [Positive, Negative, Surprise, Neutral]
+// Down-weight Negative, up-weight Neutral to counter FER2025 class imbalance.
+const List<double> kEmotionClassWeights = [1.0, 0.50, 1.0, 1.50];
+const int kEmotionSmoothingLen = 8;
 
 const int kDefaultResolutionIndex = 1;
 
@@ -152,10 +160,11 @@ class _CameraScreenState extends State<CameraScreen> {
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
   double _lastEmotionConf = 0.0;
-  String? _emotionError; // non-null when last emotion attempt failed
+  String? _emotionError;
   double _lastCropMean = 0.0;
   double _lastLmMean = 0.0;
-  bool _emotionInFlight = false; // prevents piling up async runs
+  bool _emotionInFlight = false;
+  final List<String> _emotionVoteBuffer = [];
 
   // ── Debug data ──
   int _cropRotation = 0;
@@ -264,6 +273,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _lastHandLandmarks = [];
       _posBuffer.clear();
       _recentSignPredictions.clear();
+      _emotionVoteBuffer.clear();
       _resIndex = (_resIndex + 1) % kResolutionOptions.length;
     });
     try {
@@ -280,6 +290,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _lastHandLandmarks = [];
       _posBuffer.clear();
       _recentSignPredictions.clear();
+      _emotionVoteBuffer.clear();
     });
     try {
       await _controller?.stopImageStream();
@@ -356,8 +367,6 @@ class _CameraScreenState extends State<CameraScreen> {
         _emotionFrameCounter++;
         if (_emotionFrameCounter % kEmotionEveryNFrames == 0) {
           _emotionInFlight = true;
-          // Fire and forget — do NOT await inside the frame pipeline,
-          // otherwise a slow crop/PNG stalls the next camera frame.
           _runEmotionInference(
             image,
             faceLandmarks,
@@ -481,11 +490,9 @@ class _CameraScreenState extends State<CameraScreen> {
     CameraImage image,
     List<Landmark> faceLandmarks,
   ) async {
-    // Any error sets `_emotionError` so the debug strip shows what failed,
-    // and ensures we never silently die again.
     String? localError;
     try {
-      // 1) Map raw image-space landmarks → preview space (matches painter)
+      // 1) Landmarks → preview space (matches crop frame)
       final preview = <Landmark>[];
       for (final lm in faceLandmarks) {
         if (_isFrontCamera) {
@@ -509,7 +516,7 @@ class _CameraScreenState extends State<CameraScreen> {
       final double y0 = (cy - size * 0.65).clamp(0.0, 1.0);
       final double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
 
-      // 2) Sample Y plane into a 48x48 grayscale crop
+      // 2) Sample Y plane → 48x48 grayscale
       final yPlane = image.planes[0];
       final bytes = yPlane.bytes;
       final int rowStride = yPlane.bytesPerRow;
@@ -577,9 +584,9 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       }
 
-      // 4) Build landmark vector
+      // 4) Landmark vector — SAME frame as the crop (preview space)
       final lmVec = <double>[];
-      for (final lm in faceLandmarks) {
+      for (final lm in preview) {
         lmVec.add(lm.x);
         lmVec.add(lm.y);
       }
@@ -600,18 +607,76 @@ class _CameraScreenState extends State<CameraScreen> {
         'mean=${lmMean.toStringAsFixed(3)}',
       );
 
-      // 5) Run model
+      // 5) Inference + post-processing
       final result = _emotionService.predict(crop, lmVec);
       if (result == null) {
         localError = 'predict → null';
         debugPrint('EMO: predict returned null');
       } else {
-        final (label, conf, probs) = result;
+        final (_, _, rawProbs) = result;
+
+        // 5a) Class weights → re-normalize
+        final weighted = List<double>.filled(4, 0.0);
+        double wSum = 0.0;
+        for (int i = 0; i < 4; i++) {
+          weighted[i] = rawProbs[i] * kEmotionClassWeights[i];
+          wSum += weighted[i];
+        }
+        if (wSum > 0) {
+          for (int i = 0; i < 4; i++) {
+            weighted[i] /= wSum;
+          }
+        }
+
+        // 5b) Current frame's top class
+        int frameIdx = 0;
+        double frameTop = weighted[0];
+        for (int i = 1; i < 4; i++) {
+          if (weighted[i] > frameTop) {
+            frameTop = weighted[i];
+            frameIdx = i;
+          }
+        }
+        final frameLabel = EmotionModelService.classNames[frameIdx];
+
+        // 5c) Push into vote buffer if above threshold
+        if (frameTop >= kEmotionMinConfidence) {
+          _emotionVoteBuffer.add(frameLabel);
+          if (_emotionVoteBuffer.length > kEmotionSmoothingLen) {
+            _emotionVoteBuffer.removeAt(0);
+          }
+        }
+
+        // 5d) Majority vote → smoothed label
+        String smoothedLabel = frameLabel;
+        double smoothedConf = frameTop;
+        if (_emotionVoteBuffer.isNotEmpty) {
+          final counts = <String, int>{};
+          for (final lbl in _emotionVoteBuffer) {
+            counts[lbl] = (counts[lbl] ?? 0) + 1;
+          }
+          final winner = counts.entries.reduce(
+            (a, b) => a.value >= b.value ? a : b,
+          );
+          smoothedLabel = winner.key;
+
+          final smoothedIdx = EmotionModelService.classNames.indexOf(
+            smoothedLabel,
+          );
+          if (smoothedIdx >= 0) {
+            smoothedConf = weighted[smoothedIdx];
+          }
+        }
+
         debugPrint(
-          'EMO: label=$label conf=${conf.toStringAsFixed(3)} probs=$probs',
+          'EMO: raw=${rawProbs.map((p) => p.toStringAsFixed(2)).toList()} '
+          'weighted=${weighted.map((p) => p.toStringAsFixed(2)).toList()} '
+          'frame=$frameLabel(${(frameTop * 100).toStringAsFixed(0)}%) '
+          'smoothed=$smoothedLabel(${(smoothedConf * 100).toStringAsFixed(0)}%) '
+          'votes=${_emotionVoteBuffer.length}',
         );
 
-        // 6) Generate PNG preview (with timeout — never hang the loop)
+        // 6) Crop PNG for debug strip
         Uint8List? png;
         try {
           png = await _cropToPng(crop).timeout(kEmotionCropTimeout);
@@ -621,15 +686,13 @@ class _CameraScreenState extends State<CameraScreen> {
 
         if (!mounted) return;
         setState(() {
-          _lastEmotionProbs = probs;
+          _lastEmotionProbs = weighted;
           _lastCropPng = png ?? _lastCropPng;
           _lastCropMean = rawMean;
           _lastLmMean = lmMean;
           _emotionError = null;
-          if (conf >= kEmotionMinConfidence) {
-            _lastEmotion = label;
-            _lastEmotionConf = conf;
-          }
+          _lastEmotion = smoothedLabel;
+          _lastEmotionConf = smoothedConf;
         });
       }
     } catch (e, st) {
@@ -712,6 +775,7 @@ class _CameraScreenState extends State<CameraScreen> {
             onPressed: () => setState(() {
               _sentenceBuffer.clear();
               _recentSignPredictions.clear();
+              _emotionVoteBuffer.clear();
             }),
           ),
         ],
