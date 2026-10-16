@@ -4,11 +4,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-/// Runs emotion_model.tflite — inputs: image + landmarks → 4 classes.
+/// Runs emotion_model.tflite — inputs: (1, 48, 48, 1) + (1, 936) → (1, 4)
 ///
-/// Feeds flat Float32List buffers via Interpreter.run(). The typed-list path
-/// in tflite_flutter copies raw bytes into the tensor backing store, skipping
-/// the nested-list shape-guessing that produced a 5D tensor on Conv2D input.
+/// Uses getInputTensor(i).setTo(reshaped) + invoke(), NOT run([...]).
+/// Passing flat Float32List to run() triggers tflite_flutter's auto-resize
+/// path, which corrupts the tensor shape from [1,48,48,1] to [2,2304].
+/// setTo() with a correctly-shaped nested list writes bytes directly.
 class EmotionModelService {
   Interpreter? _interpreter;
   bool _loaded = false;
@@ -34,6 +35,11 @@ class EmotionModelService {
     );
     _interpreter = Interpreter.fromBuffer(modelData.buffer.asUint8List());
 
+    // Allocate tensors ONCE. Calling allocateTensors during run() is what
+    // triggered the "Bad state: failed precondition".
+    _interpreter!.allocateTensors();
+
+    debugPrint('EMO-MODEL: loaded bytes = ${modelData.lengthInBytes}');
     debugPrint('EMO-MODEL: loaded');
     final inTensors = _interpreter!.getInputTensors();
     for (int i = 0; i < inTensors.length; i++) {
@@ -57,7 +63,6 @@ class EmotionModelService {
 
   /// [image] flat 48*48 = 2304 floats in [0,1].
   /// [landmarks] flat 936 floats.
-  /// Returns (label, confidence, allProbs) or null on any failure.
   (String, double, List<double>)? predict(
     List<double> image,
     List<double> landmarks,
@@ -68,22 +73,15 @@ class EmotionModelService {
       return null;
     }
     if (image.length != imgSize * imgSize) {
-      debugPrint(
-        'EMO-PRED: bad image len ${image.length} '
-        '(expected ${imgSize * imgSize})',
-      );
+      debugPrint('EMO-PRED: bad image len ${image.length}');
       return null;
     }
     if (landmarks.length != numLandmarks) {
-      debugPrint(
-        'EMO-PRED: bad lm len ${landmarks.length} '
-        '(expected $numLandmarks)',
-      );
+      debugPrint('EMO-PRED: bad lm len ${landmarks.length}');
       return null;
     }
 
     try {
-      // ── Sanity: verify tensor byte counts before handing over buffers ──
       final in0 = interp.getInputTensor(0);
       final in1 = interp.getInputTensor(1);
       final out0 = interp.getOutputTensor(0);
@@ -98,35 +96,43 @@ class EmotionModelService {
         'out0.shape=${out0.shape} (${outElems}e)',
       );
 
-      if (in0Elems != image.length) {
-        debugPrint(
-          'EMO-PRED: tensor0 expects $in0Elems elems, '
-          'we have ${image.length}',
-        );
-        return null;
-      }
-      if (in1Elems != landmarks.length) {
-        debugPrint(
-          'EMO-PRED: tensor1 expects $in1Elems elems, '
-          'we have ${landmarks.length}',
-        );
-        return null;
-      }
-      if (outElems != numClasses) {
-        debugPrint('EMO-PRED: out tensor expects $outElems elems');
+      if (in0Elems != image.length || in1Elems != landmarks.length) {
+        debugPrint('EMO-PRED: element count mismatch, bailing');
         return null;
       }
 
-      // ── Flat typed buffers ──────────────────────────────────────────────
-      final imgInput = Float32List.fromList(image); // 2304 floats
-      final lmInput = Float32List.fromList(landmarks); // 936 floats
-      final outBuf = Float32List(numClasses); // 4 floats
+      // ── Build correctly-shaped nested lists ──────────────────────────────
+      // `.reshape([...])` from tflite_flutter produces nested lists whose
+      // structure matches the target tensor, so setTo() does a plain byte
+      // copy with no resize.
+      final imgInput = image.reshape([1, imgSize, imgSize, 1]);
+      final lmInput = landmarks.reshape([1, numLandmarks]);
+      final outBuf = List<double>.filled(
+        numClasses,
+        0.0,
+      ).reshape([1, numClasses]);
 
-      // run(List, List) internally dispatches to runForMultipleInputs with a
-      // Map<int,Object> for outputs. This is the correct entry point.
-      interp.run([imgInput, lmInput], [outBuf]);
+      // ── Write inputs via setTo ───────────────────────────────────────────
+      in0.setTo(imgInput);
+      in1.setTo(lmInput);
 
-      final probs = outBuf.toList();
+      // ── Run ──────────────────────────────────────────────────────────────
+      interp.invoke();
+
+      // ── Read output ──────────────────────────────────────────────────────
+      final outData = out0.data; // Uint8List view
+      final probs = List<double>.from(
+        outData.buffer.asFloat32List(
+          outData.offsetInBytes,
+          outData.lengthInBytes ~/ 4,
+        ),
+      );
+
+      // Manual sanity: verify probs look like a softmax distribution
+      final double sum = probs.fold<double>(0.0, (a, b) => a + b);
+      if (sum < 0.5 || sum > 1.5) {
+        debugPrint('EMO-PRED: suspicious prob sum = $sum, probs=$probs');
+      }
 
       int bestIdx = 0;
       double bestProb = probs[0];
