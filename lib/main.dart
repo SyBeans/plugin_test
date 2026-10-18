@@ -1,6 +1,4 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -28,27 +26,24 @@ const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
 // ═══════════════════════════════════════════════════════════
-// SIGN — NATURAL CONTINUOUS SIGNING
-// Motion gate only suppresses STILL hands. While actively
-// signing, predictions run continuously and new signs commit
-// as soon as their labels stabilize in a rolling vote window.
+// SIGN — TIME-BASED NATURAL STREAMING
 // ═══════════════════════════════════════════════════════════
-const int kSignBufferLen = 30; // model input window
-const int kSignKeepFrames = 40; // rolling buffer cap
 const int kSignFeaturesPerFrame = 126;
 const double kSignMinConfidence = 0.50;
+
+// Time-based buffer (matches training 4-second clips)
+const double kSignBufferSeconds = 4.0;
+const int kSignMinFramesToPredict = 8;
 
 // Motion gate
 const int kSignMotionHistoryLen = 10;
 const double kSignMotionStartThreshold = 0.015;
 
-// Inference cadence while active
-const int kSignPredictEveryNFrames = 3;
-
-// Label stabilization
+// Inference & Voting
+const int kSignPredictEveryNFrames = 2;
 const int kSignVoteWindow = 6;
 const int kSignStableVoteCount = 4;
-const int kSignCooldownFrames = 8;
+const double kSignCooldownSeconds = 1.0;
 
 // Hand dropout tolerance
 const int kSignHandDropDelay = 6;
@@ -71,7 +66,6 @@ class Landmark {
     : x = x ?? 0.0,
       y = y ?? 0.0,
       z = z ?? 0.0;
-  Map<String, double> toJson() => {'x': x, 'y': y, 'z': z};
 }
 
 class FrameResult {
@@ -160,14 +154,14 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // ── Sign: continuous streaming state ──
-  final List<List<double>> _posBuffer = [];
+  // ── Sign: Time-based streaming state ──
+  final List<MapEntry<int, List<double>>> _signBuffer = [];
   List<double>? _lastSignPositions;
   final List<double> _signMotionHistory = [];
   bool _signActive = false;
   int _signNoHandFrames = 0;
   int _signPredictCounter = 0;
-  int _signCooldown = 0;
+  int _signCooldownUntil = 0;
   final List<String> _signVoteBuffer = [];
 
   String _lastSign = '—';
@@ -190,6 +184,7 @@ class _CameraScreenState extends State<CameraScreen> {
   List<double> _lastEmotionProbs = [0, 0, 0, 0];
   List<double> _lastSignProbs = [];
   double _lastMotion = 0.0;
+  double _signBufSpan = 0.0;
   Uint8List? _lastCropPng;
 
   @override
@@ -398,22 +393,30 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // SIGN — CONTINUOUS NATURAL STREAMING
+  // SIGN — TIME-BASED STREAMING
   // ═══════════════════════════════════════════════════════════
   void _updateSignStream() {
-    // ── Hand absent ──
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final bufferLimitMs = (kSignBufferSeconds * 1000).toInt();
+
+    // Trim old frames
+    _signBuffer.removeWhere((e) => nowMs - e.key > bufferLimitMs);
+
     if (_lastHandLandmarks.isEmpty) {
       _signNoHandFrames++;
       if (_signNoHandFrames >= kSignHandDropDelay) {
         _signActive = false;
-        _signVoteBuffer.clear();
+        _signBuffer.clear();
+        _signMotionHistory.clear();
+        _lastSignPositions = null;
+        _signPredictCounter = 0;
         _bufferState = 'idle (no hand)';
       }
       return;
     }
     _signNoHandFrames = 0;
 
-    // ── Build 126-feature frame ──
+    // Build 126-feature frame
     final frame = List<double>.filled(kSignFeaturesPerFrame, 0.0);
     final handCount = _lastHandLandmarks.length ~/ 21;
     for (int h = 0; h < math.min(handCount, 2); h++) {
@@ -426,7 +429,7 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     }
 
-    // ── Motion (Euclidean norm vs previous frame) ──
+    // Motion
     double motion = 0.0;
     if (_lastSignPositions != null) {
       double sumSq = 0.0;
@@ -444,40 +447,35 @@ class _CameraScreenState extends State<CameraScreen> {
       _signMotionHistory.removeAt(0);
     }
 
-    // ── Active if any recent frame had motion ──
     final anyMotion = _signMotionHistory.any(
       (m) => m > kSignMotionStartThreshold,
     );
 
     if (!anyMotion) {
       _signActive = false;
-      _signVoteBuffer.clear();
+      _signBuffer.clear();
       _bufferState = 'idle (still)';
       return;
     }
 
     _signActive = true;
+    _signBuffer.add(MapEntry(nowMs, frame));
 
-    // ── Push to rolling buffer ──
-    _posBuffer.add(frame);
-    if (_posBuffer.length > kSignKeepFrames) _posBuffer.removeAt(0);
+    // Calculate buffer span for debug
+    if (_signBuffer.length >= 2) {
+      _signBufSpan = (_signBuffer.last.key - _signBuffer.first.key) / 1000.0;
+    } else {
+      _signBufSpan = 0.0;
+    }
 
-    if (_posBuffer.length < kSignBufferLen) {
-      _bufferState = 'filling ${_posBuffer.length}/30';
+    if (nowMs < _signCooldownUntil) {
+      _bufferState = 'cooldown';
       return;
     }
 
-    // ── Cooldown after a commit ──
-    if (_signCooldown > 0) {
-      _signCooldown--;
-      _bufferState = 'cooldown $_signCooldown';
-      return;
-    }
-
-    // ── Predict every N active frames ──
     _signPredictCounter++;
     if (_signPredictCounter % kSignPredictEveryNFrames != 0) {
-      _bufferState = 'active buf=${_posBuffer.length}';
+      _bufferState = 'active buf=${_signBuffer.length}';
       return;
     }
 
@@ -486,19 +484,35 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   void _runContinuousInference() {
-    // Build (30, 252) from the last kSignBufferLen frames
-    final int n = _posBuffer.length;
-    final List<List<double>> window = _posBuffer.sublist(n - kSignBufferLen);
+    if (_signBuffer.length < kSignMinFramesToPredict) return;
 
+    // 1. Resample time-based buffer to 30 frames
+    final int tMin = _signBuffer.first.key;
+    final int tMax = _signBuffer.last.key;
+    if (tMax <= tMin) return;
+
+    final List<List<double>> sampled = [];
+    int bufIdx = 0;
+    for (int i = 0; i < 30; i++) {
+      final targetTs = tMin + ((tMax - tMin) * i / 29).round();
+      while (bufIdx < _signBuffer.length - 1 &&
+          (_signBuffer[bufIdx + 1].key - targetTs).abs() <
+              (_signBuffer[bufIdx].key - targetTs).abs()) {
+        bufIdx++;
+      }
+      sampled.add(_signBuffer[bufIdx].value);
+    }
+
+    // 2. Build (30, 252) with velocity
     final sequence = <List<double>>[];
-    for (int i = 0; i < kSignBufferLen; i++) {
+    for (int i = 0; i < 30; i++) {
       final frame = List<double>.filled(252, 0.0);
       for (int j = 0; j < kSignFeaturesPerFrame; j++) {
-        frame[j] = window[i][j];
+        frame[j] = sampled[i][j];
       }
       if (i > 0) {
         for (int j = 0; j < kSignFeaturesPerFrame; j++) {
-          frame[kSignFeaturesPerFrame + j] = window[i][j] - window[i - 1][j];
+          frame[kSignFeaturesPerFrame + j] = sampled[i][j] - sampled[i - 1][j];
         }
       }
       sequence.add(frame);
@@ -516,7 +530,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (conf < kSignMinConfidence) return;
 
-    // ── Vote window ──
+    // 3. Vote window
     _signVoteBuffer.add(label);
     if (_signVoteBuffer.length > kSignVoteWindow) {
       _signVoteBuffer.removeAt(0);
@@ -531,34 +545,35 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (winner.value < kSignStableVoteCount) return;
 
-    // Only commit if different from last committed word
+    // 4. Commit
     if (_sentenceBuffer.isEmpty || _sentenceBuffer.last != winner.key) {
       debugPrint(
-        'SIGN: committed ${winner.key} '
-        '(${winner.value}/$kSignVoteWindow votes)',
+        'SIGN: committed ${winner.key} (${winner.value}/$kSignVoteWindow)',
       );
       setState(() {
         _sentenceBuffer.add(winner.key);
         _signVoteBuffer.clear();
-        _signCooldown = kSignCooldownFrames;
+        _signCooldownUntil =
+            DateTime.now().millisecondsSinceEpoch +
+            (kSignCooldownSeconds * 1000).toInt();
       });
     }
   }
 
   void _resetSignStream() {
-    _posBuffer.clear();
+    _signBuffer.clear();
     _lastSignPositions = null;
     _signMotionHistory.clear();
     _signNoHandFrames = 0;
     _signPredictCounter = 0;
-    _signCooldown = 0;
+    _signCooldownUntil = 0;
     _signActive = false;
     _signVoteBuffer.clear();
     _bufferState = 'idle';
   }
 
   // ═══════════════════════════════════════════════════════════
-  // EMOTION (unchanged)
+  // EMOTION (Unchanged)
   // ═══════════════════════════════════════════════════════════
   Future<void> _runEmotionInference(
     CameraImage image,
@@ -668,19 +683,9 @@ class _CameraScreenState extends State<CameraScreen> {
       }
       final lmMean = lmSum / lmVec.length;
 
-      debugPrint(
-        'EMO: crop min=${rawMin.toStringAsFixed(3)} '
-        'max=${rawMax.toStringAsFixed(3)} '
-        'mean=${rawMean.toStringAsFixed(3)} | '
-        'lm min=${lmMin.toStringAsFixed(3)} '
-        'max=${lmMax.toStringAsFixed(3)} '
-        'mean=${lmMean.toStringAsFixed(3)}',
-      );
-
       final result = _emotionService.predict(crop, lmVec);
       if (result == null) {
         localError = 'predict → null';
-        debugPrint('EMO: predict returned null');
       } else {
         final (_, _, rawProbs) = result;
 
@@ -733,20 +738,10 @@ class _CameraScreenState extends State<CameraScreen> {
           }
         }
 
-        debugPrint(
-          'EMO: raw=${rawProbs.map((p) => p.toStringAsFixed(2)).toList()} '
-          'weighted=${weighted.map((p) => p.toStringAsFixed(2)).toList()} '
-          'frame=$frameLabel(${(frameTop * 100).toStringAsFixed(0)}%) '
-          'smoothed=$smoothedLabel(${(smoothedConf * 100).toStringAsFixed(0)}%) '
-          'votes=${_emotionVoteBuffer.length}',
-        );
-
         Uint8List? png;
         try {
           png = await _cropToPng(crop).timeout(kEmotionCropTimeout);
-        } catch (e) {
-          debugPrint('EMO: cropToPng failed: $e');
-        }
+        } catch (e) {}
 
         if (!mounted) return;
         setState(() {
@@ -761,7 +756,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
     } catch (e, st) {
       localError = e.toString();
-      debugPrint('EMO: THREW $e\n$st');
     }
 
     if (localError != null && mounted) {
@@ -940,7 +934,7 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildDebugStrip() {
     return Container(
-      width: 178,
+      width: 185,
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.82),
@@ -1028,15 +1022,6 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ],
           ),
-          if (_lastCropMean > 0)
-            Padding(
-              padding: const EdgeInsets.only(top: 3),
-              child: Text(
-                'crop mean ${_lastCropMean.toStringAsFixed(2)}'
-                '  lm mean ${_lastLmMean.toStringAsFixed(2)}',
-                style: const TextStyle(color: Colors.white54, fontSize: 8),
-              ),
-            ),
           const SizedBox(height: 6),
           const Divider(color: Colors.white24, height: 1),
           const SizedBox(height: 6),
@@ -1085,8 +1070,12 @@ class _CameraScreenState extends State<CameraScreen> {
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           Text(
+            'buf ${_signBuffer.length}f / ${_signBufSpan.toStringAsFixed(1)}s',
+            style: const TextStyle(color: Colors.white70, fontSize: 9),
+          ),
+          Text(
             'motion ${_lastMotion.toStringAsFixed(3)}  '
-            'votes ${_signVoteBuffer.length}/$kSignVoteWindow',
+            'votes ${_signVoteBuffer.length}/6',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           const SizedBox(height: 4),
@@ -1241,15 +1230,6 @@ class _CameraScreenState extends State<CameraScreen> {
                 ],
               ),
             ),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Preview: $_previewSize',
-            style: const TextStyle(color: Colors.yellow, fontSize: 10),
-          ),
-          Text(
-            'Frame: $_frameSize',
-            style: const TextStyle(color: Colors.pink, fontSize: 10),
           ),
         ],
       ),
