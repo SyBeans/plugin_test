@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -55,7 +57,8 @@ const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.40;
 const Duration kEmotionCropTimeout = Duration(milliseconds: 400);
 
-const List<double> kEmotionClassWeights = [1.0, 0.50, 1.0, 1.50];
+// FIXED: Boost Negative (2.0), suppress Neutral (0.8)
+const List<double> kEmotionClassWeights = [1.0, 2.0, 1.0, 0.8];
 const int kEmotionSmoothingLen = 8;
 
 const int kDefaultResolutionIndex = 1;
@@ -249,13 +252,33 @@ class _CameraScreenState extends State<CameraScreen> {
       delegate: HandLandmarkerDelegate.gpu,
     );
 
+    // ── FIXED: HAND DUPLICATE FILTER ──
     _handSub ??= _handPlugin!.landmarkStream.listen((hands) {
       final lms = <Landmark>[];
-      for (final hand in hands) {
-        for (final lm in hand.landmarks) {
+
+      if (hands.isNotEmpty) {
+        // Always add the first hand
+        for (final lm in hands[0].landmarks) {
           lms.add(Landmark(lm.x, lm.y, lm.z));
         }
+
+        // Check if a 2nd hand is real or a hallucination
+        if (hands.length > 1) {
+          final h1Wrist = hands[0].landmarks[0];
+          final h2Wrist = hands[1].landmarks[0];
+          final dx = h1Wrist.x - h2Wrist.x;
+          final dy = h1Wrist.y - h2Wrist.y;
+          final dist = math.sqrt(dx * dx + dy * dy);
+
+          // Only add if wrists are far apart
+          if (dist > 0.12) {
+            for (final lm in hands[1].landmarks) {
+              lms.add(Landmark(lm.x, lm.y, lm.z));
+            }
+          }
+        }
       }
+
       _lastHandLandmarks = lms;
       if (lms.length >= 21) {
         final xs = lms.map((l) => l.x).toList();
@@ -336,18 +359,17 @@ class _CameraScreenState extends State<CameraScreen> {
       final frameW = image.width.toDouble();
       final frameH = image.height.toDouble();
 
-      if (faces != null) {
-        for (final face in faces) {
-          final mesh = face.mesh;
-          if (mesh != null) {
-            for (final point in mesh.points) {
-              final px = point.x ?? 0.0;
-              final py = point.y ?? 0.0;
-              final pz = point.z ?? 0.0;
-              final nx = (px > 1.5) ? (px / frameW) : px;
-              final ny = (py > 1.5) ? (py / frameH) : py;
-              faceLandmarks.add(Landmark(nx, ny, pz));
-            }
+      // ── FIXED: FACE DUPLICATE FILTER ──
+      if (faces != null && faces.isNotEmpty) {
+        final mesh = faces.first.mesh; // <-- ONLY TAKE THE FIRST FACE
+        if (mesh != null) {
+          for (final point in mesh.points) {
+            final px = point.x ?? 0.0;
+            final py = point.y ?? 0.0;
+            final pz = point.z ?? 0.0;
+            final nx = (px > 1.5) ? (px / frameW) : px;
+            final ny = (py > 1.5) ? (py / frameH) : py;
+            faceLandmarks.add(Landmark(nx, ny, pz));
           }
         }
       }
@@ -573,7 +595,7 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // EMOTION (Unchanged)
+  // EMOTION
   // ═══════════════════════════════════════════════════════════
   Future<void> _runEmotionInference(
     CameraImage image,
