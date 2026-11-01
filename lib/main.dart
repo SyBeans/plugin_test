@@ -57,8 +57,8 @@ const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.40;
 const Duration kEmotionCropTimeout = Duration(milliseconds: 400);
 
-// FIXED: Boost Negative (2.0), suppress Neutral (0.8)
-const List<double> kEmotionClassWeights = [1.0, 1.2, 1.0, 0.8];
+// Reverted to original weights for baseline testing
+const List<double> kEmotionClassWeights = [1.0, 0.50, 1.0, 1.50];
 const int kEmotionSmoothingLen = 8;
 
 const int kDefaultResolutionIndex = 1;
