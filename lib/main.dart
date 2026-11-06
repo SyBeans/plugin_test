@@ -46,14 +46,24 @@ const double kSignCooldownSeconds = 1.0;
 
 const int kSignHandDropDelay = 6;
 
+// Debug toggle — turn on to print wrist/fingertip coords once per prediction.
+// Expected after fix (front camera, fingers pointing up in portrait):
+//   wrist.y > mid.y should be FALSE in the printed vector space,
+//   i.e. after un-rotation the wrist should sit on the LEFT of the fingertip
+//   in the landscape-oriented feature vector.
+const bool kDebugSignOrientation = false;
+
 // ═══════════════════════════════════════════════════════════
 // EMOTION
 // ═══════════════════════════════════════════════════════════
 const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.40;
 
-// FIXED: Crushed Negative (0.2) and massively boosted Neutral (3.0)
-const List<double> kEmotionClassWeights = [1.0, 0.2, 1.0, 3.0];
+// FIXED for v11.8: class balancing was already applied at TRAINING time
+// (class_weight_dict={0:1.0, 1:1.05, 2:1.25, 3:1.20}), so no post-softmax
+// re-weighting is needed. The old [1.0, 0.2, 1.0, 3.0] was a v11.7 hack that
+// suppressed Negative and inflated Neutral — do NOT put it back.
+const List<double> kEmotionClassWeights = [1.0, 1.0, 1.0, 1.0];
 const int kEmotionSmoothingLen = 8;
 
 const int kDefaultResolutionIndex = 1;
@@ -438,11 +448,50 @@ class _CameraScreenState extends State<CameraScreen> {
       for (int i = 0; i < 21; i++) {
         final lm = _lastHandLandmarks[h * 21 + i];
         final base = h * 63 + i * 3;
-        // Mirror X to match the Python webcam cv2.flip
-        frame[base + 0] = _isFrontCamera ? (1.0 - lm.x) : lm.x;
-        frame[base + 1] = lm.y;
-        frame[base + 2] = lm.z;
+
+        // ────────────────────────────────────────────────────────
+        // ORIENTATION FIX
+        // ────────────────────────────────────────────────────────
+        // hand_landmarker (with sensorOrientation passed in) returns
+        // landmarks in PORTRAIT display space. The sign model was
+        // trained on LANDSCAPE webcam frames that were then mirrored
+        // with cv2.flip(frame, 1). So we must:
+        //   1) un-rotate portrait → landscape (same as face path)
+        //   2) mirror x to match cv2.flip
+        //
+        // Front camera:
+        //   portrait (x_p, y_p)  → landscape  (y_p, 1 - x_p)
+        //                         → mirrored  (1 - y_p, 1 - x_p)
+        // Back camera:
+        //   portrait (x_p, y_p)  → landscape  (1 - y_p, x_p)
+        //                         → mirrored  (y_p, x_p)
+        // ────────────────────────────────────────────────────────
+        double lx, ly;
+        if (_isFrontCamera) {
+          lx = 1.0 - lm.y;
+          ly = 1.0 - lm.x;
+        } else {
+          lx = lm.y;
+          ly = lm.x;
+        }
+
+        frame[base + 0] = lx;
+        frame[base + 1] = ly;
+        frame[base + 2] = lm.z; // z is orientation-independent
       }
+    }
+
+    // Optional one-shot debug print (enable via kDebugSignOrientation).
+    if (kDebugSignOrientation && _lastHandLandmarks.length >= 21) {
+      final wristX = frame[0];
+      final wristY = frame[1];
+      final midX = frame[36]; // lm 12 → base 36 in first hand
+      final midY = frame[37];
+      debugPrint(
+        'SIGN ORIENT wrist=(${wristX.toStringAsFixed(2)},'
+        '${wristY.toStringAsFixed(2)}) '
+        'mid=(${midX.toStringAsFixed(2)},${midY.toStringAsFixed(2)})',
+      );
     }
 
     double motion = 0.0;
@@ -580,6 +629,11 @@ class _CameraScreenState extends State<CameraScreen> {
     _signActive = false;
     _signVoteBuffer.clear();
     _bufferState = 'idle';
+    // Also wipe the last top-N probabilities so the debug strip doesn't
+    // show stale numbers after a hand drop or camera switch.
+    _lastSignProbs = [];
+    _lastSignConf = 0.0;
+    _lastSign = '—';
   }
 
   Future<void> _runEmotionInference(
