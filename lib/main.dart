@@ -17,11 +17,11 @@ const bool kSwapDims = true;
 const bool kUseContain = false;
 const double kOffsetShiftX = 0.0;
 const double kOffsetShiftY = 0.0;
-const double kHandScale = 0.55;
-const double kFaceDotRadius = 1.0;
-const double kHandTipRadius = 3.0;
+const double kHandScale = 1.0; // FIXED: Glued to fingertips like webcam
+const double kFaceDotRadius = 3.0;
+const double kHandTipRadius = 4.0;
 const double kHandJointRadius = 1.8;
-const double kFaceDotOpacity = 0.55;
+const double kFaceDotOpacity = 0.85;
 const int kFrameSkip = 1;
 const bool kShowDebugFrame = false;
 const int kBackRotationMode = 1;
@@ -33,21 +33,17 @@ const double kMinHandSpan = 0.12;
 const int kSignFeaturesPerFrame = 126;
 const double kSignMinConfidence = 0.50;
 
-// Time-based buffer (matches training 4-second clips)
 const double kSignBufferSeconds = 4.0;
 const int kSignMinFramesToPredict = 8;
 
-// Motion gate
 const int kSignMotionHistoryLen = 10;
 const double kSignMotionStartThreshold = 0.015;
 
-// Inference & Voting
 const int kSignPredictEveryNFrames = 2;
 const int kSignVoteWindow = 6;
 const int kSignStableVoteCount = 4;
 const double kSignCooldownSeconds = 1.0;
 
-// Hand dropout tolerance
 const int kSignHandDropDelay = 6;
 
 // ═══════════════════════════════════════════════════════════
@@ -55,10 +51,9 @@ const int kSignHandDropDelay = 6;
 // ═══════════════════════════════════════════════════════════
 const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.40;
-const Duration kEmotionCropTimeout = Duration(milliseconds: 400);
 
-// Reverted to original weights for baseline testing
-const List<double> kEmotionClassWeights = [1.0, 0.50, 1.0, 1.50];
+// FIXED: Crushed Negative (0.2) and massively boosted Neutral (3.0)
+const List<double> kEmotionClassWeights = [1.0, 0.2, 1.0, 3.0];
 const int kEmotionSmoothingLen = 8;
 
 const int kDefaultResolutionIndex = 1;
@@ -137,9 +132,11 @@ class _CameraScreenState extends State<CameraScreen> {
   int _lastFpsTime = DateTime.now().millisecondsSinceEpoch;
   int _framesSinceFps = 0;
   List<Landmark> _lastHandLandmarks = [];
+  List<Landmark> _lastFaceLandmarks = [];
   int _frameSkipCounter = 0;
   double _lastHandSpan = 0;
   bool _handTooSmall = false;
+  int _processFrameCounter = 0;
 
   late CameraDescription _currentCamera;
   int _cameraIndex = 0;
@@ -157,7 +154,6 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // ── Sign: Time-based streaming state ──
   final List<MapEntry<int, List<double>>> _signBuffer = [];
   List<double>? _lastSignPositions;
   final List<double> _signMotionHistory = [];
@@ -172,7 +168,6 @@ class _CameraScreenState extends State<CameraScreen> {
   final List<String> _sentenceBuffer = [];
   String _bufferState = 'idle';
 
-  // ── Emotion state ──
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
   double _lastEmotionConf = 0.0;
@@ -182,13 +177,11 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _emotionInFlight = false;
   final List<String> _emotionVoteBuffer = [];
 
-  // ── Debug data ──
   int _cropRotation = 0;
   List<double> _lastEmotionProbs = [0, 0, 0, 0];
   List<double> _lastSignProbs = [];
   double _lastMotion = 0.0;
   double _signBufSpan = 0.0;
-  Uint8List? _lastCropPng;
 
   @override
   void initState() {
@@ -252,17 +245,14 @@ class _CameraScreenState extends State<CameraScreen> {
       delegate: HandLandmarkerDelegate.gpu,
     );
 
-    // ── FIXED: HAND DUPLICATE FILTER ──
     _handSub ??= _handPlugin!.landmarkStream.listen((hands) {
       final lms = <Landmark>[];
 
       if (hands.isNotEmpty) {
-        // Always add the first hand
         for (final lm in hands[0].landmarks) {
           lms.add(Landmark(lm.x, lm.y, lm.z));
         }
 
-        // Check if a 2nd hand is real or a hallucination
         if (hands.length > 1) {
           final h1Wrist = hands[0].landmarks[0];
           final h2Wrist = hands[1].landmarks[0];
@@ -270,7 +260,6 @@ class _CameraScreenState extends State<CameraScreen> {
           final dy = h1Wrist.y - h2Wrist.y;
           final dist = math.sqrt(dx * dx + dy * dy);
 
-          // Only add if wrists are far apart
           if (dist > 0.12) {
             for (final lm in hands[1].landmarks) {
               lms.add(Landmark(lm.x, lm.y, lm.z));
@@ -308,6 +297,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _isSwitching = true;
       _lastResult = null;
       _lastHandLandmarks = [];
+      _lastFaceLandmarks = [];
       _resetSignStream();
       _emotionVoteBuffer.clear();
       _resIndex = (_resIndex + 1) % kResolutionOptions.length;
@@ -324,6 +314,7 @@ class _CameraScreenState extends State<CameraScreen> {
       _isSwitching = true;
       _lastResult = null;
       _lastHandLandmarks = [];
+      _lastFaceLandmarks = [];
       _resetSignStream();
       _emotionVoteBuffer.clear();
     });
@@ -343,8 +334,10 @@ class _CameraScreenState extends State<CameraScreen> {
 
     _isDetecting = true;
     final stopwatch = Stopwatch()..start();
+    _processFrameCounter++;
 
     try {
+      // Hands process EVERY frame to keep the velocity accurate (matches webcam)
       try {
         _handPlugin?.processFrame(
           image,
@@ -354,22 +347,24 @@ class _CameraScreenState extends State<CameraScreen> {
         debugPrint('Hand error: $e');
       }
 
-      final faces = await _faceDetector?.detectFacesFromCameraImage(image);
-      final faceLandmarks = <Landmark>[];
-      final frameW = image.width.toDouble();
-      final frameH = image.height.toDouble();
+      // Face processes every 2nd frame to save CPU
+      if (_processFrameCounter % 2 == 0) {
+        final faces = await _faceDetector?.detectFacesFromCameraImage(image);
+        _lastFaceLandmarks.clear();
 
-      // ── FIXED: FACE DUPLICATE FILTER ──
-      if (faces != null && faces.isNotEmpty) {
-        final mesh = faces.first.mesh; // <-- ONLY TAKE THE FIRST FACE
-        if (mesh != null) {
-          for (final point in mesh.points) {
-            final px = point.x ?? 0.0;
-            final py = point.y ?? 0.0;
-            final pz = point.z ?? 0.0;
-            final nx = (px > 1.5) ? (px / frameW) : px;
-            final ny = (py > 1.5) ? (py / frameH) : py;
-            faceLandmarks.add(Landmark(nx, ny, pz));
+        if (faces != null && faces.isNotEmpty) {
+          final mesh = faces.first.mesh;
+          if (mesh != null) {
+            final frameW = image.width.toDouble();
+            final frameH = image.height.toDouble();
+            for (final point in mesh.points) {
+              final px = point.x ?? 0.0;
+              final py = point.y ?? 0.0;
+              final pz = point.z ?? 0.0;
+              final nx = (px > 1.5) ? (px / frameW) : px;
+              final ny = (py > 1.5) ? (py / frameH) : py;
+              _lastFaceLandmarks.add(Landmark(nx, ny, pz));
+            }
           }
         }
       }
@@ -386,7 +381,7 @@ class _CameraScreenState extends State<CameraScreen> {
       if (mounted) {
         setState(() {
           _lastResult = FrameResult(
-            faceLandmarks: faceLandmarks,
+            faceLandmarks: List.from(_lastFaceLandmarks),
             handLandmarks: List.from(_lastHandLandmarks),
             inferenceTimeMs: inferenceTime,
           );
@@ -397,13 +392,16 @@ class _CameraScreenState extends State<CameraScreen> {
 
       if (_modelsReady) _updateSignStream();
 
-      if (_modelsReady && faceLandmarks.length >= 400 && !_emotionInFlight) {
+      if (_modelsReady &&
+          _processFrameCounter % 2 == 0 &&
+          _lastFaceLandmarks.length >= 400 &&
+          !_emotionInFlight) {
         _emotionFrameCounter++;
         if (_emotionFrameCounter % kEmotionEveryNFrames == 0) {
           _emotionInFlight = true;
           _runEmotionInference(
             image,
-            faceLandmarks,
+            _lastFaceLandmarks,
           ).whenComplete(() => _emotionInFlight = false);
         }
       }
@@ -414,14 +412,10 @@ class _CameraScreenState extends State<CameraScreen> {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // SIGN — TIME-BASED STREAMING
-  // ═══════════════════════════════════════════════════════════
   void _updateSignStream() {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final bufferLimitMs = (kSignBufferSeconds * 1000).toInt();
 
-    // Trim old frames
     _signBuffer.removeWhere((e) => nowMs - e.key > bufferLimitMs);
 
     if (_lastHandLandmarks.isEmpty) {
@@ -438,20 +432,19 @@ class _CameraScreenState extends State<CameraScreen> {
     }
     _signNoHandFrames = 0;
 
-    // Build 126-feature frame
     final frame = List<double>.filled(kSignFeaturesPerFrame, 0.0);
     final handCount = _lastHandLandmarks.length ~/ 21;
     for (int h = 0; h < math.min(handCount, 2); h++) {
       for (int i = 0; i < 21; i++) {
         final lm = _lastHandLandmarks[h * 21 + i];
         final base = h * 63 + i * 3;
-        frame[base + 0] = lm.x;
+        // Mirror X to match the Python webcam cv2.flip
+        frame[base + 0] = _isFrontCamera ? (1.0 - lm.x) : lm.x;
         frame[base + 1] = lm.y;
         frame[base + 2] = lm.z;
       }
     }
 
-    // Motion
     double motion = 0.0;
     if (_lastSignPositions != null) {
       double sumSq = 0.0;
@@ -483,7 +476,6 @@ class _CameraScreenState extends State<CameraScreen> {
     _signActive = true;
     _signBuffer.add(MapEntry(nowMs, frame));
 
-    // Calculate buffer span for debug
     if (_signBuffer.length >= 2) {
       _signBufSpan = (_signBuffer.last.key - _signBuffer.first.key) / 1000.0;
     } else {
@@ -508,7 +500,6 @@ class _CameraScreenState extends State<CameraScreen> {
   void _runContinuousInference() {
     if (_signBuffer.length < kSignMinFramesToPredict) return;
 
-    // 1. Resample time-based buffer to 30 frames
     final int tMin = _signBuffer.first.key;
     final int tMax = _signBuffer.last.key;
     if (tMax <= tMin) return;
@@ -525,7 +516,6 @@ class _CameraScreenState extends State<CameraScreen> {
       sampled.add(_signBuffer[bufIdx].value);
     }
 
-    // 2. Build (30, 252) with velocity
     final sequence = <List<double>>[];
     for (int i = 0; i < 30; i++) {
       final frame = List<double>.filled(252, 0.0);
@@ -552,7 +542,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (conf < kSignMinConfidence) return;
 
-    // 3. Vote window
     _signVoteBuffer.add(label);
     if (_signVoteBuffer.length > kSignVoteWindow) {
       _signVoteBuffer.removeAt(0);
@@ -567,7 +556,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (winner.value < kSignStableVoteCount) return;
 
-    // 4. Commit
     if (_sentenceBuffer.isEmpty || _sentenceBuffer.last != winner.key) {
       debugPrint(
         'SIGN: committed ${winner.key} (${winner.value}/$kSignVoteWindow)',
@@ -594,9 +582,6 @@ class _CameraScreenState extends State<CameraScreen> {
     _bufferState = 'idle';
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // EMOTION
-  // ═══════════════════════════════════════════════════════════
   Future<void> _runEmotionInference(
     CameraImage image,
     List<Landmark> faceLandmarks,
@@ -760,15 +745,9 @@ class _CameraScreenState extends State<CameraScreen> {
           }
         }
 
-        Uint8List? png;
-        try {
-          png = await _cropToPng(crop).timeout(kEmotionCropTimeout);
-        } catch (e) {}
-
         if (!mounted) return;
         setState(() {
           _lastEmotionProbs = weighted;
-          _lastCropPng = png ?? _lastCropPng;
           _lastCropMean = rawMean;
           _lastLmMean = lmMean;
           _emotionError = null;
@@ -785,33 +764,6 @@ class _CameraScreenState extends State<CameraScreen> {
         _emotionError = localError;
       });
     }
-  }
-
-  Future<Uint8List> _cropToPng(List<double> crop) {
-    final rgba = Uint8List(48 * 48 * 4);
-    for (int i = 0; i < 48 * 48; i++) {
-      final v = (crop[i] * 255).clamp(0, 255).toInt();
-      rgba[i * 4 + 0] = v;
-      rgba[i * 4 + 1] = v;
-      rgba[i * 4 + 2] = v;
-      rgba[i * 4 + 3] = 255;
-    }
-    final completer = Completer<Uint8List>();
-    ui.decodeImageFromPixels(rgba, 48, 48, ui.PixelFormat.rgba8888, (
-      img,
-    ) async {
-      try {
-        final bd = await img.toByteData(format: ui.ImageByteFormat.png);
-        if (bd == null) {
-          completer.completeError('toByteData returned null');
-          return;
-        }
-        completer.complete(bd.buffer.asUint8List());
-      } catch (e, st) {
-        completer.completeError(e, st);
-      }
-    });
-    return completer.future;
   }
 
   @override
@@ -968,7 +920,7 @@ class _CameraScreenState extends State<CameraScreen> {
         mainAxisSize: MainAxisSize.min,
         children: [
           const Text(
-            'CROP',
+            'ROTATION',
             style: TextStyle(
               color: Colors.orangeAccent,
               fontSize: 9,
@@ -977,72 +929,39 @@ class _CameraScreenState extends State<CameraScreen> {
             ),
           ),
           const SizedBox(height: 4),
-          Row(
-            children: [
-              Container(
-                width: 60,
-                height: 60,
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.white24, width: 1),
-                  borderRadius: BorderRadius.circular(4),
-                  color: Colors.black,
-                ),
-                child: _lastCropPng == null
-                    ? const Center(
-                        child: Text(
-                          '—',
-                          style: TextStyle(color: Colors.white38, fontSize: 9),
-                        ),
-                      )
-                    : Image.memory(
-                        _lastCropPng!,
-                        width: 60,
-                        height: 60,
-                        fit: BoxFit.contain,
-                        filterQuality: FilterQuality.none,
-                        gaplessPlayback: true,
-                      ),
+          GestureDetector(
+            onTap: () {
+              setState(() {
+                _cropRotation = (_cropRotation + 90) % 360;
+              });
+            },
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(6),
               ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: GestureDetector(
-                  onTap: () {
-                    setState(() {
-                      _cropRotation = (_cropRotation + 90) % 360;
-                    });
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 4,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withOpacity(0.12),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(
-                          Icons.rotate_right,
-                          size: 14,
-                          color: Colors.yellowAccent,
-                        ),
-                        const SizedBox(height: 2),
-                        Text(
-                          '${_cropRotation}°',
-                          style: const TextStyle(
-                            color: Colors.yellowAccent,
-                            fontSize: 11,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(
+                    Icons.rotate_right,
+                    size: 16,
+                    color: Colors.yellowAccent,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Crop: ${_cropRotation}°',
+                    style: const TextStyle(
+                      color: Colors.yellowAccent,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-                ),
+                ],
               ),
-            ],
+            ),
           ),
           const SizedBox(height: 6),
           const Divider(color: Colors.white24, height: 1),
@@ -1316,7 +1235,7 @@ class _CameraScreenState extends State<CameraScreen> {
 }
 
 // ============================================================
-// LANDMARK PAINTER
+// LANDMARK PAINTER (MINIMALIST DOTS ONLY)
 // ============================================================
 class LandmarkPainter extends CustomPainter {
   final List<Landmark> faceLandmarks;
@@ -1334,30 +1253,6 @@ class LandmarkPainter extends CustomPainter {
     required this.isFrontCamera,
     required this.sensorOrientation,
   });
-
-  static const _handConnections = [
-    [0, 1],
-    [1, 2],
-    [2, 3],
-    [3, 4],
-    [0, 5],
-    [5, 6],
-    [6, 7],
-    [7, 8],
-    [5, 9],
-    [9, 10],
-    [10, 11],
-    [11, 12],
-    [9, 13],
-    [13, 14],
-    [14, 15],
-    [15, 16],
-    [13, 17],
-    [17, 18],
-    [18, 19],
-    [19, 20],
-    [0, 17],
-  ];
 
   Offset _rotate(double x, double y) {
     if (isFrontCamera) {
@@ -1433,32 +1328,31 @@ class LandmarkPainter extends CustomPainter {
     final offsetX = (size.width - scaledW) / 2;
     final offsetY = (size.height - scaledH) / 2;
 
-    if (kShowDebugFrame) {
-      canvas.drawRect(
-        Rect.fromLTWH(0, 0, size.width, size.height),
-        Paint()
-          ..color = Colors.green
-          ..strokeWidth = 4
-          ..style = PaintingStyle.stroke,
-      );
-    }
-
+    // ── FACE: Draw only 5 specific dots ──
     final paintFace = Paint()
       ..color = Colors.red.withOpacity(kFaceDotOpacity)
       ..style = PaintingStyle.fill;
-    for (final lm in faceLandmarks) {
-      final p = _mapFace(lm, scaledW, scaledH, offsetX, offsetY);
-      canvas.drawCircle(p, kFaceDotRadius, paintFace);
+
+    if (faceLandmarks.length >= 455) {
+      const faceIndices = [10, 234, 152, 454, 1];
+      for (final idx in faceIndices) {
+        final p = _mapFace(
+          faceLandmarks[idx],
+          scaledW,
+          scaledH,
+          offsetX,
+          offsetY,
+        );
+        canvas.drawCircle(p, kFaceDotRadius, paintFace);
+        canvas.drawCircle(p, 1.0, Paint()..color = Colors.white);
+      }
     }
 
+    // ── HAND: Draw only 6 dots (Wrist + 5 Fingertips) ──
     final paintHand = Paint()
       ..color = Colors.green
       ..strokeWidth = 2.0
       ..style = PaintingStyle.fill;
-    final paintLine = Paint()
-      ..color = Colors.green.withOpacity(0.7)
-      ..strokeWidth = 2.0
-      ..style = PaintingStyle.stroke;
 
     const perHand = 21;
     const double rejectRadius = 0.35;
@@ -1475,34 +1369,26 @@ class LandmarkPainter extends CustomPainter {
       cy /= slice.length;
       final anchor = Offset(cx, cy);
 
-      final pts = <Offset?>[];
-      for (final lm in slice) {
+      const handIndices = [0, 4, 8, 12, 16, 20];
+
+      for (final idx in handIndices) {
+        final lm = slice[idx];
         final dx = (lm.x - cx).abs();
         final dy = (lm.y - cy).abs();
-        if (dx > rejectRadius || dy > rejectRadius) {
-          pts.add(null);
-          continue;
-        }
-        pts.add(
-          _mapHand(lm, scaledW, scaledH, offsetX, offsetY, anchor, kHandScale),
-        );
-      }
 
-      for (final conn in _handConnections) {
-        final a = pts[conn[0]];
-        final b = pts[conn[1]];
-        if (a != null && b != null) canvas.drawLine(a, b, paintLine);
-      }
-      for (int i = 0; i < pts.length; i++) {
-        final p = pts[i];
-        if (p == null) continue;
-        final isTip =
-            i == 0 || i == 4 || i == 8 || i == 12 || i == 16 || i == 20;
-        canvas.drawCircle(
-          p,
-          isTip ? kHandTipRadius : kHandJointRadius,
-          paintHand,
+        if (dx > rejectRadius || dy > rejectRadius) continue;
+
+        final p = _mapHand(
+          lm,
+          scaledW,
+          scaledH,
+          offsetX,
+          offsetY,
+          anchor,
+          kHandScale,
         );
+        canvas.drawCircle(p, kHandTipRadius, paintHand);
+        canvas.drawCircle(p, 1.5, Paint()..color = Colors.white);
       }
     }
   }
