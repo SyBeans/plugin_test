@@ -17,12 +17,11 @@ const bool kSwapDims = true;
 const bool kUseContain = false;
 const double kOffsetShiftX = 0.0;
 const double kOffsetShiftY = 0.0;
-const double kHandScale = 1.0; // FIXED: Glued to fingertips like webcam
+const double kHandScale = 1.0;
 const double kFaceDotRadius = 3.0;
 const double kHandTipRadius = 4.0;
 const double kHandJointRadius = 1.8;
 const double kFaceDotOpacity = 0.85;
-const int kFrameSkip = 1;
 const bool kShowDebugFrame = false;
 const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
@@ -47,26 +46,30 @@ const double kSignCooldownSeconds = 1.0;
 const int kSignHandDropDelay = 6;
 
 // Debug toggle — turn on to print wrist/fingertip coords once per prediction.
-// Expected after fix (front camera, fingers pointing up in portrait):
-//   wrist.y > mid.y should be FALSE in the printed vector space,
-//   i.e. after un-rotation the wrist should sit on the LEFT of the fingertip
-//   in the landscape-oriented feature vector.
 const bool kDebugSignOrientation = false;
 
 // ═══════════════════════════════════════════════════════════
 // EMOTION
 // ═══════════════════════════════════════════════════════════
-const int kEmotionEveryNFrames = 5;
 const double kEmotionMinConfidence = 0.40;
 
-// FIXED for v11.8: class balancing was already applied at TRAINING time
-// (class_weight_dict={0:1.0, 1:1.05, 2:1.25, 3:1.20}), so no post-softmax
-// re-weighting is needed. The old [1.0, 0.2, 1.0, 3.0] was a v11.7 hack that
-// suppressed Negative and inflated Neutral — do NOT put it back.
+// FIXED for v11.8: class balancing was applied at TRAINING time
+// (class_weight_dict={0:1.0, 1:1.05, 2:1.25, 3:1.20}). No post-softmax
+// re-weighting. Never restore [1.0, 0.2, 1.0, 3.0] — that was a v11.7 hack.
 const List<double> kEmotionClassWeights = [1.0, 1.0, 1.0, 1.0];
 const int kEmotionSmoothingLen = 8;
 
-const int kDefaultResolutionIndex = 1;
+// ═══════════════════════════════════════════════════════════
+// RESOLUTION-AWARE PERFORMANCE TUNING
+// ═══════════════════════════════════════════════════════════
+// LOW  (index 0, 240p) → webcam-style: process every frame, alternate
+//                        hands/face per frame, emotion every 3rd face frame
+// MED  (index 1, 480p) → current behavior: every 2nd frame, hands every
+//                        processed frame, face every 2nd processed frame,
+//                        emotion every 5th face frame
+// HIGH (index 2, 720p) → same as MED (usually won't be used on TECNO)
+const int kDefaultResolutionIndex =
+    0; // ← LOW is now the default (closest to webcam)
 
 class Landmark {
   final double x, y, z;
@@ -193,6 +196,18 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastMotion = 0.0;
   double _signBufSpan = 0.0;
 
+  // ────────────────────────────────────────────────────────
+  // RESOLUTION-AWARE PERFORMANCE PARAMETERS
+  // ────────────────────────────────────────────────────────
+  /// Raw frame divider. LOW=1 (process every frame), MED/HIGH=2 (skip every 2nd).
+  int get _rawFrameSkipMod => _resIndex == 0 ? 1 : 2;
+
+  /// Whether to alternate hands/face per processed frame (webcam-style).
+  bool get _alternateMediaPipe => _resIndex == 0;
+
+  /// Emotion cadence — every Nth face-frame.
+  int get _effectiveEmotionSkip => _resIndex == 0 ? 3 : 5;
+
   @override
   void initState() {
     super.initState();
@@ -310,6 +325,8 @@ class _CameraScreenState extends State<CameraScreen> {
       _lastFaceLandmarks = [];
       _resetSignStream();
       _emotionVoteBuffer.clear();
+      _frameSkipCounter = 0;
+      _processFrameCounter = 0;
       _resIndex = (_resIndex + 1) % kResolutionOptions.length;
     });
     try {
@@ -339,26 +356,43 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _processCameraImage(CameraImage image) async {
     if (_isDetecting) return;
     if (_isSwitching) return;
+
+    // Resolution-aware frame skip
     _frameSkipCounter++;
-    if (_frameSkipCounter % (kFrameSkip + 1) != 0) return;
+    if (_frameSkipCounter % _rawFrameSkipMod != 0) return;
 
     _isDetecting = true;
     final stopwatch = Stopwatch()..start();
     _processFrameCounter++;
 
     try {
-      // Hands process EVERY frame to keep the velocity accurate (matches webcam)
-      try {
-        _handPlugin?.processFrame(
-          image,
-          _controller!.description.sensorOrientation,
-        );
-      } catch (e) {
-        debugPrint('Hand error: $e');
+      // ── Decide which model runs this frame ──
+      final bool isHandFrame;
+      final bool isFaceFrame;
+      if (_alternateMediaPipe) {
+        // LOW mode: webcam-style alternating
+        isHandFrame = (_processFrameCounter % 2 == 0);
+        isFaceFrame = (_processFrameCounter % 2 == 1);
+      } else {
+        // MED / HIGH: hands every processed frame, face every 2nd processed
+        isHandFrame = true;
+        isFaceFrame = (_processFrameCounter % 2 == 0);
       }
 
-      // Face processes every 2nd frame to save CPU
-      if (_processFrameCounter % 2 == 0) {
+      // ── Hands ──
+      if (isHandFrame) {
+        try {
+          _handPlugin?.processFrame(
+            image,
+            _controller!.description.sensorOrientation,
+          );
+        } catch (e) {
+          debugPrint('Hand error: $e');
+        }
+      }
+
+      // ── Face ──
+      if (isFaceFrame) {
         final faces = await _faceDetector?.detectFacesFromCameraImage(image);
         _lastFaceLandmarks.clear();
 
@@ -400,14 +434,18 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
 
-      if (_modelsReady) _updateSignStream();
+      // ── Sign streamer: only on hand frames ──
+      if (_modelsReady && isHandFrame) {
+        _updateSignStream();
+      }
 
+      // ── Emotion: only on face frames ──
       if (_modelsReady &&
-          _processFrameCounter % 2 == 0 &&
+          isFaceFrame &&
           _lastFaceLandmarks.length >= 400 &&
           !_emotionInFlight) {
         _emotionFrameCounter++;
-        if (_emotionFrameCounter % kEmotionEveryNFrames == 0) {
+        if (_emotionFrameCounter % _effectiveEmotionSkip == 0) {
           _emotionInFlight = true;
           _runEmotionInference(
             image,
@@ -449,23 +487,8 @@ class _CameraScreenState extends State<CameraScreen> {
         final lm = _lastHandLandmarks[h * 21 + i];
         final base = h * 63 + i * 3;
 
-        // ────────────────────────────────────────────────────────
-        // ORIENTATION FIX
-        // ────────────────────────────────────────────────────────
-        // hand_landmarker (with sensorOrientation passed in) returns
-        // landmarks in PORTRAIT display space. The sign model was
-        // trained on LANDSCAPE webcam frames that were then mirrored
-        // with cv2.flip(frame, 1). So we must:
-        //   1) un-rotate portrait → landscape (same as face path)
-        //   2) mirror x to match cv2.flip
-        //
-        // Front camera:
-        //   portrait (x_p, y_p)  → landscape  (y_p, 1 - x_p)
-        //                         → mirrored  (1 - y_p, 1 - x_p)
-        // Back camera:
-        //   portrait (x_p, y_p)  → landscape  (1 - y_p, x_p)
-        //                         → mirrored  (y_p, x_p)
-        // ────────────────────────────────────────────────────────
+        // ORIENTATION FIX: portrait → landscape → mirror
+        // (matches cv2.flip(frame, 1) in test_webcam_combined.py)
         double lx, ly;
         if (_isFrontCamera) {
           lx = 1.0 - lm.y;
@@ -477,15 +500,14 @@ class _CameraScreenState extends State<CameraScreen> {
 
         frame[base + 0] = lx;
         frame[base + 1] = ly;
-        frame[base + 2] = lm.z; // z is orientation-independent
+        frame[base + 2] = lm.z;
       }
     }
 
-    // Optional one-shot debug print (enable via kDebugSignOrientation).
     if (kDebugSignOrientation && _lastHandLandmarks.length >= 21) {
       final wristX = frame[0];
       final wristY = frame[1];
-      final midX = frame[36]; // lm 12 → base 36 in first hand
+      final midX = frame[36];
       final midY = frame[37];
       debugPrint(
         'SIGN ORIENT wrist=(${wristX.toStringAsFixed(2)},'
@@ -629,8 +651,6 @@ class _CameraScreenState extends State<CameraScreen> {
     _signActive = false;
     _signVoteBuffer.clear();
     _bufferState = 'idle';
-    // Also wipe the last top-N probabilities so the debug strip doesn't
-    // show stale numbers after a hand drop or camera switch.
     _lastSignProbs = [];
     _lastSignConf = 0.0;
     _lastSign = '—';
@@ -961,6 +981,9 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Widget _buildDebugStrip() {
+    // Show which mode is active so you can see what the perf profile is
+    final modeLabel = _alternateMediaPipe ? 'ALT (LOW)' : 'BOTH (MED/HIGH)';
+
     return Container(
       width: 185,
       padding: const EdgeInsets.all(8),
@@ -973,6 +996,24 @@ class _CameraScreenState extends State<CameraScreen> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
+          const Text(
+            'PERF PROFILE',
+            style: TextStyle(
+              color: Colors.orangeAccent,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '$modeLabel  |  skip=$_rawFrameSkipMod  |  emo=1/$_effectiveEmotionSkip',
+            style: const TextStyle(color: Colors.white70, fontSize: 9),
+          ),
+          const SizedBox(height: 6),
+          const Divider(color: Colors.white24, height: 1),
+          const SizedBox(height: 6),
+
           const Text(
             'ROTATION',
             style: TextStyle(
@@ -1199,6 +1240,10 @@ class _CameraScreenState extends State<CameraScreen> {
             'Latency: ${_lastResult?.inferenceTimeMs ?? 0} ms',
             style: const TextStyle(color: Colors.white, fontSize: 12),
           ),
+          Text(
+            'Frame: $_frameSize',
+            style: const TextStyle(color: Colors.white70, fontSize: 10),
+          ),
           const SizedBox(height: 6),
           InkWell(
             onTap: _isSwitching ? null : _cycleResolution,
@@ -1382,7 +1427,6 @@ class LandmarkPainter extends CustomPainter {
     final offsetX = (size.width - scaledW) / 2;
     final offsetY = (size.height - scaledH) / 2;
 
-    // ── FACE: Draw only 5 specific dots ──
     final paintFace = Paint()
       ..color = Colors.red.withOpacity(kFaceDotOpacity)
       ..style = PaintingStyle.fill;
@@ -1402,7 +1446,6 @@ class LandmarkPainter extends CustomPainter {
       }
     }
 
-    // ── HAND: Draw only 6 dots (Wrist + 5 Fingertips) ──
     final paintHand = Paint()
       ..color = Colors.green
       ..strokeWidth = 2.0
