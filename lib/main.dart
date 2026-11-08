@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart'; // Required for compute()
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:face_detection_tflite/face_detection_tflite.dart';
@@ -17,7 +18,7 @@ const bool kSwapDims = true;
 const bool kUseContain = false;
 const double kOffsetShiftX = 0.0;
 const double kOffsetShiftY = 0.0;
-const double kHandScale = 1.0;
+const double kHandScale = 1.0; // FIXED: Glued to fingertips like webcam
 const double kFaceDotRadius = 3.0;
 const double kHandTipRadius = 4.0;
 const double kHandJointRadius = 1.8;
@@ -45,7 +46,6 @@ const double kSignCooldownSeconds = 1.0;
 
 const int kSignHandDropDelay = 6;
 
-// Debug toggle — turn on to print wrist/fingertip coords once per prediction.
 const bool kDebugSignOrientation = false;
 
 // ═══════════════════════════════════════════════════════════
@@ -53,23 +53,14 @@ const bool kDebugSignOrientation = false;
 // ═══════════════════════════════════════════════════════════
 const double kEmotionMinConfidence = 0.40;
 
-// FIXED for v11.8: class balancing was applied at TRAINING time
-// (class_weight_dict={0:1.0, 1:1.05, 2:1.25, 3:1.20}). No post-softmax
-// re-weighting. Never restore [1.0, 0.2, 1.0, 3.0] — that was a v11.7 hack.
+// FIXED for v11.8: class balancing was applied at TRAINING time.
 const List<double> kEmotionClassWeights = [1.0, 1.0, 1.0, 1.0];
 const int kEmotionSmoothingLen = 8;
 
 // ═══════════════════════════════════════════════════════════
 // RESOLUTION-AWARE PERFORMANCE TUNING
 // ═══════════════════════════════════════════════════════════
-// LOW  (index 0, 240p) → webcam-style: process every frame, alternate
-//                        hands/face per frame, emotion every 3rd face frame
-// MED  (index 1, 480p) → current behavior: every 2nd frame, hands every
-//                        processed frame, face every 2nd processed frame,
-//                        emotion every 5th face frame
-// HIGH (index 2, 720p) → same as MED (usually won't be used on TECNO)
-const int kDefaultResolutionIndex =
-    0; // ← LOW is now the default (closest to webcam)
+const int kDefaultResolutionIndex = 0; // LOW is default
 
 class Landmark {
   final double x, y, z;
@@ -102,6 +93,46 @@ const List<ResolutionOption> kResolutionOptions = [
   ResolutionOption('MED', ResolutionPreset.medium, Icons.sd_card),
   ResolutionOption('HIGH', ResolutionPreset.high, Icons.sd_card_alert_outlined),
 ];
+
+// ═══════════════════════════════════════════════════════════
+// ISOLATE FUNCTION FOR EMOTION CROP (Optimization #1)
+// ═══════════════════════════════════════════════════════════
+// Moving this heavy pixel math off the UI thread prevents micro-stutters.
+List<double> _extractFaceCropInBackground(Map<String, dynamic> data) {
+  final Uint8List bytes = data['bytes'];
+  final int width = data['width'];
+  final int height = data['height'];
+  final int rowStride = data['rowStride'];
+  final int pixelStride = data['pixelStride'];
+  final double x0 = data['x0'];
+  final double x1 = data['x1'];
+  final double y0 = data['y0'];
+  final double y1 = data['y1'];
+  final bool isFrontCamera = data['isFrontCamera'];
+
+  final raw = List<double>.filled(48 * 48, 0.0);
+  for (int yy = 0; yy < 48; yy++) {
+    for (int xx = 0; xx < 48; xx++) {
+      final px = x0 + (xx / 48.0) * (x1 - x0);
+      final py = y0 + (yy / 48.0) * (y1 - y0);
+      double rawX, rawY;
+      if (isFrontCamera) {
+        rawX = 1.0 - py;
+        rawY = px;
+      } else {
+        rawX = py;
+        rawY = 1.0 - px;
+      }
+      final srcX = (rawX * width).toInt().clamp(0, width - 1);
+      final srcY = (rawY * height).toInt().clamp(0, height - 1);
+      final idx = srcY * rowStride + srcX * pixelStride;
+      if (idx >= 0 && idx < bytes.length) {
+        raw[yy * 48 + xx] = bytes[idx] / 255.0;
+      }
+    }
+  }
+  return raw;
+}
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -196,17 +227,20 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastMotion = 0.0;
   double _signBufSpan = 0.0;
 
-  // ────────────────────────────────────────────────────────
-  // RESOLUTION-AWARE PERFORMANCE PARAMETERS
-  // ────────────────────────────────────────────────────────
-  /// Raw frame divider. LOW=1 (process every frame), MED/HIGH=2 (skip every 2nd).
-  int get _rawFrameSkipMod => _resIndex == 0 ? 1 : 2;
+  // ══════════════════════════════════════════════════════════
+  // UNIVERSAL PERFORMANCE PROFILE
+  // ══════════════════════════════════════════════════════════
 
-  /// Whether to alternate hands/face per processed frame (webcam-style).
-  bool get _alternateMediaPipe => _resIndex == 0;
+  // HIGH skips every 2nd frame (because 720p is massive). LOW/MED process all.
+  int get _rawFrameSkipMod => _resIndex == 2 ? 2 : 1;
 
-  /// Emotion cadence — every Nth face-frame.
-  int get _effectiveEmotionSkip => _resIndex == 0 ? 3 : 5;
+  // ALWAYS alternate, no matter the resolution.
+  // This guarantees only 1 MediaPipe model runs per frame, saving battery/heat.
+  bool get _alternateMediaPipe => true;
+
+  // Emotion cadence: LOW=5, MED=6, HIGH=8 (slower updates on higher res to save power)
+  int get _effectiveEmotionSkip =>
+      _resIndex == 0 ? 5 : (_resIndex == 1 ? 6 : 8);
 
   @override
   void initState() {
@@ -221,14 +255,22 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _loadModels() async {
+    // 1. Load Sign Model (Independent catch)
     try {
       await _signService.load();
-      await _emotionService.load();
-      if (mounted) setState(() => _modelsReady = true);
-      debugPrint('✅ Both models loaded');
     } catch (e, st) {
-      debugPrint('Model load error: $e\n$st');
+      debugPrint('❌ Sign Model load error: $e\n$st');
     }
+
+    // 2. Load Emotion Model (Independent catch)
+    try {
+      await _emotionService.load();
+    } catch (e, st) {
+      debugPrint('❌ Emotion Model load error: $e\n$st');
+    }
+
+    if (mounted) setState(() => _modelsReady = true);
+    debugPrint('✅ Model loading sequence finished');
   }
 
   Future<void> _initializeCamera() async {
@@ -357,7 +399,6 @@ class _CameraScreenState extends State<CameraScreen> {
     if (_isDetecting) return;
     if (_isSwitching) return;
 
-    // Resolution-aware frame skip
     _frameSkipCounter++;
     if (_frameSkipCounter % _rawFrameSkipMod != 0) return;
 
@@ -366,20 +407,10 @@ class _CameraScreenState extends State<CameraScreen> {
     _processFrameCounter++;
 
     try {
-      // ── Decide which model runs this frame ──
-      final bool isHandFrame;
-      final bool isFaceFrame;
-      if (_alternateMediaPipe) {
-        // LOW mode: webcam-style alternating
-        isHandFrame = (_processFrameCounter % 2 == 0);
-        isFaceFrame = (_processFrameCounter % 2 == 1);
-      } else {
-        // MED / HIGH: hands every processed frame, face every 2nd processed
-        isHandFrame = true;
-        isFaceFrame = (_processFrameCounter % 2 == 0);
-      }
+      // ALWAYS alternate now for all resolutions
+      final bool isHandFrame = (_processFrameCounter % 2 == 0);
+      final bool isFaceFrame = (_processFrameCounter % 2 == 1);
 
-      // ── Hands ──
       if (isHandFrame) {
         try {
           _handPlugin?.processFrame(
@@ -391,7 +422,6 @@ class _CameraScreenState extends State<CameraScreen> {
         }
       }
 
-      // ── Face ──
       if (isFaceFrame) {
         final faces = await _faceDetector?.detectFacesFromCameraImage(image);
         _lastFaceLandmarks.clear();
@@ -434,12 +464,10 @@ class _CameraScreenState extends State<CameraScreen> {
         });
       }
 
-      // ── Sign streamer: only on hand frames ──
       if (_modelsReady && isHandFrame) {
         _updateSignStream();
       }
 
-      // ── Emotion: only on face frames ──
       if (_modelsReady &&
           isFaceFrame &&
           _lastFaceLandmarks.length >= 400 &&
@@ -463,7 +491,6 @@ class _CameraScreenState extends State<CameraScreen> {
   void _updateSignStream() {
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     final bufferLimitMs = (kSignBufferSeconds * 1000).toInt();
-
     _signBuffer.removeWhere((e) => nowMs - e.key > bufferLimitMs);
 
     if (_lastHandLandmarks.isEmpty) {
@@ -486,9 +513,6 @@ class _CameraScreenState extends State<CameraScreen> {
       for (int i = 0; i < 21; i++) {
         final lm = _lastHandLandmarks[h * 21 + i];
         final base = h * 63 + i * 3;
-
-        // ORIENTATION FIX: portrait → landscape → mirror
-        // (matches cv2.flip(frame, 1) in test_webcam_combined.py)
         double lx, ly;
         if (_isFrontCamera) {
           lx = 1.0 - lm.y;
@@ -497,23 +521,10 @@ class _CameraScreenState extends State<CameraScreen> {
           lx = lm.y;
           ly = lm.x;
         }
-
         frame[base + 0] = lx;
         frame[base + 1] = ly;
         frame[base + 2] = lm.z;
       }
-    }
-
-    if (kDebugSignOrientation && _lastHandLandmarks.length >= 21) {
-      final wristX = frame[0];
-      final wristY = frame[1];
-      final midX = frame[36];
-      final midY = frame[37];
-      debugPrint(
-        'SIGN ORIENT wrist=(${wristX.toStringAsFixed(2)},'
-        '${wristY.toStringAsFixed(2)}) '
-        'mid=(${midX.toStringAsFixed(2)},${midY.toStringAsFixed(2)})',
-      );
     }
 
     double motion = 0.0;
@@ -686,49 +697,26 @@ class _CameraScreenState extends State<CameraScreen> {
       final double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
 
       final yPlane = image.planes[0];
-      final bytes = yPlane.bytes;
-      final int rowStride = yPlane.bytesPerRow;
-      final int pixelStride = yPlane.bytesPerPixel ?? 1;
 
-      final raw = List<double>.filled(48 * 48, 0.0);
-      double rawMin = double.infinity;
-      double rawMax = -double.infinity;
-      double rawSum = 0.0;
+      // ── Optimization #1: Run heavy math on a background Isolate ──
+      final raw = await compute(_extractFaceCropInBackground, {
+        'bytes': yPlane.bytes,
+        'width': image.width,
+        'height': image.height,
+        'rowStride': yPlane.bytesPerRow,
+        'pixelStride': yPlane.bytesPerPixel ?? 1,
+        'x0': x0,
+        'x1': x1,
+        'y0': y0,
+        'y1': y1,
+        'isFrontCamera': _isFrontCamera,
+      });
 
-      for (int yy = 0; yy < 48; yy++) {
-        for (int xx = 0; xx < 48; xx++) {
-          final double px = x0 + (xx / 48.0) * (x1 - x0);
-          final double py = y0 + (yy / 48.0) * (y1 - y0);
-
-          double rawX, rawY;
-          if (_isFrontCamera) {
-            rawX = 1.0 - py;
-            rawY = px;
-          } else {
-            rawX = py;
-            rawY = 1.0 - px;
-          }
-
-          final int srcX = (rawX * image.width).toInt().clamp(
-            0,
-            image.width - 1,
-          );
-          final int srcY = (rawY * image.height).toInt().clamp(
-            0,
-            image.height - 1,
-          );
-          final int idx = srcY * rowStride + srcX * pixelStride;
-          double v = 0.0;
-          if (idx >= 0 && idx < bytes.length) {
-            v = bytes[idx] / 255.0;
-          }
-          raw[yy * 48 + xx] = v;
-          if (v < rawMin) rawMin = v;
-          if (v > rawMax) rawMax = v;
-          rawSum += v;
-        }
+      double rawMean = 0.0;
+      for (double v in raw) {
+        rawMean += v;
       }
-      final rawMean = rawSum / raw.length;
+      rawMean /= raw.length;
 
       final crop = List<double>.filled(48 * 48, 0.0);
       for (int y = 0; y < 48; y++) {
@@ -901,7 +889,6 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
           ),
-
           if (_showOverlay && _lastResult != null)
             Positioned.fill(
               child: CustomPaint(
@@ -915,12 +902,9 @@ class _CameraScreenState extends State<CameraScreen> {
                 ),
               ),
             ),
-
           Positioned(top: 20, left: 20, child: _buildStats()),
-
           if (_modelsReady)
             Positioned(top: 20, right: 20, child: _buildDebugStrip()),
-
           if (_modelsReady)
             Positioned(
               bottom: 20,
@@ -928,7 +912,6 @@ class _CameraScreenState extends State<CameraScreen> {
               right: 20,
               child: _buildSignPanel(),
             ),
-
           if (_handTooSmall && _lastHandSpan > 0)
             Positioned(
               bottom: 220,
@@ -954,7 +937,6 @@ class _CameraScreenState extends State<CameraScreen> {
                 ),
               ),
             ),
-
           if (_isSwitching)
             const Positioned.fill(
               child: ColoredBox(
@@ -962,7 +944,6 @@ class _CameraScreenState extends State<CameraScreen> {
                 child: Center(child: CircularProgressIndicator()),
               ),
             ),
-
           if (!_modelsReady)
             const Positioned(
               top: 20,
@@ -981,9 +962,6 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Widget _buildDebugStrip() {
-    // Show which mode is active so you can see what the perf profile is
-    final modeLabel = _alternateMediaPipe ? 'ALT (LOW)' : 'BOTH (MED/HIGH)';
-
     return Container(
       width: 185,
       padding: const EdgeInsets.all(8),
@@ -1007,13 +985,12 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
           const SizedBox(height: 2),
           Text(
-            '$modeLabel  |  skip=$_rawFrameSkipMod  |  emo=1/$_effectiveEmotionSkip',
+            'ALT (ALL RES) | skip=$_rawFrameSkipMod | emo=1/$_effectiveEmotionSkip',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           const SizedBox(height: 6),
           const Divider(color: Colors.white24, height: 1),
           const SizedBox(height: 6),
-
           const Text(
             'ROTATION',
             style: TextStyle(
@@ -1061,7 +1038,6 @@ class _CameraScreenState extends State<CameraScreen> {
           const SizedBox(height: 6),
           const Divider(color: Colors.white24, height: 1),
           const SizedBox(height: 6),
-
           const Text(
             'EMOTION',
             style: TextStyle(
@@ -1079,8 +1055,7 @@ class _CameraScreenState extends State<CameraScreen> {
           const SizedBox(height: 4),
           Text(
             _emotionError == null
-                ? '→ $_lastEmotion '
-                      '(${(_lastEmotionConf * 100).toStringAsFixed(0)}%)'
+                ? '→ $_lastEmotion (${(_lastEmotionConf * 100).toStringAsFixed(0)}%)'
                 : '⚠ $_emotionError',
             style: TextStyle(
               color: _emotionError == null ? Colors.white70 : Colors.redAccent,
@@ -1090,7 +1065,6 @@ class _CameraScreenState extends State<CameraScreen> {
             overflow: TextOverflow.ellipsis,
           ),
           const Divider(color: Colors.white24, height: 8),
-
           const Text(
             'SIGN (NATURAL)',
             style: TextStyle(
@@ -1110,8 +1084,7 @@ class _CameraScreenState extends State<CameraScreen> {
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           Text(
-            'motion ${_lastMotion.toStringAsFixed(3)}  '
-            'votes ${_signVoteBuffer.length}/6',
+            'motion ${_lastMotion.toStringAsFixed(3)}  votes ${_signVoteBuffer.length}/6',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           const SizedBox(height: 4),
@@ -1278,7 +1251,6 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildSignPanel() {
     final confPct = (_lastSignConf * 100).toStringAsFixed(0);
-
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -1450,7 +1422,6 @@ class LandmarkPainter extends CustomPainter {
       ..color = Colors.green
       ..strokeWidth = 2.0
       ..style = PaintingStyle.fill;
-
     const perHand = 21;
     const double rejectRadius = 0.35;
 

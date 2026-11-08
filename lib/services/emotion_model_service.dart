@@ -33,7 +33,24 @@ class EmotionModelService {
     final modelData = await rootBundle.load(
       'assets/models/emotion_model.tflite',
     );
-    _interpreter = Interpreter.fromBuffer(modelData.buffer.asUint8List());
+
+    final options = InterpreterOptions();
+
+    // ── Optimization #2: GPU Delegate ──
+    try {
+      options.addDelegate(GpuDelegateV2());
+      debugPrint('✅ EMO-MODEL: GPU Delegate enabled');
+    } catch (e) {
+      // Fallback to CPU if GPU delegate fails
+      debugPrint(
+        '⚠️ EMO-MODEL: GPU Delegate failed, falling back to CPU. ($e)',
+      );
+    }
+
+    _interpreter = Interpreter.fromBuffer(
+      modelData.buffer.asUint8List(),
+      options: options,
+    );
 
     // Allocate tensors ONCE. Calling allocateTensors during run() is what
     // triggered the "Bad state: failed precondition".

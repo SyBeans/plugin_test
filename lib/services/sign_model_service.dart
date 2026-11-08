@@ -1,8 +1,8 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:tflite_flutter/tflite_flutter.dart';
 
-/// Runs sign_model.tflite — input (1, 30, 252), output (1, 105)
 class SignModelService {
   Interpreter? _interpreter;
   List<String> _labels = [];
@@ -17,42 +17,50 @@ class SignModelService {
   Future<void> load() async {
     if (_loaded) return;
 
-    // Load labels
     final labelsJson = await rootBundle.loadString('assets/models/labels.json');
     _labels = List<String>.from(jsonDecode(labelsJson));
 
-    // Load model
     final modelData = await rootBundle.load('assets/models/sign_model.tflite');
-    final interpreterOptions = InterpreterOptions();
 
-    // Sign model uses Flex ops — need to enable it
-    // (loaded via native delegate on Android — see build.gradle.kts)
+    // ── Try GPU First, Fallback to CPU ──
+    try {
+      final options = InterpreterOptions();
+      options.addDelegate(GpuDelegateV2());
+      debugPrint('⏳ SIGN-MODEL: Attempting GPU Delegate...');
 
-    _interpreter = Interpreter.fromBuffer(
-      modelData.buffer.asUint8List(),
-      options: interpreterOptions,
-    );
+      _interpreter = Interpreter.fromBuffer(
+        modelData.buffer.asUint8List(),
+        options: options,
+      );
+      debugPrint('✅ SIGN-MODEL: GPU Delegate enabled successfully');
+    } catch (e) {
+      debugPrint(
+        '⚠️ SIGN-MODEL: GPU failed (BiLSTMs usually lack GPU support). Falling back to CPU...',
+      );
 
-    // Print shapes for verification
-    print('Sign model loaded:');
-    print('  inputs:  ${_interpreter!.getInputTensor(0).shape}');
-    print('  outputs: ${_interpreter!.getOutputTensor(0).shape}');
-    print('  labels:  ${_labels.length}');
+      // Fallback to CPU
+      final cpuOptions = InterpreterOptions();
+      _interpreter = Interpreter.fromBuffer(
+        modelData.buffer.asUint8List(),
+        options: cpuOptions,
+      );
+      debugPrint('✅ SIGN-MODEL: Loaded on CPU instead');
+    }
+
+    debugPrint('Sign model loaded:');
+    debugPrint('  inputs:  ${_interpreter!.getInputTensor(0).shape}');
+    debugPrint('  outputs: ${_interpreter!.getOutputTensor(0).shape}');
+    debugPrint('  labels:  ${_labels.length}');
 
     _loaded = true;
   }
 
-  /// Predict from a (30, 252) feature sequence.
-  /// Returns (label, confidence, allProbs) or null if not loaded.
   (String, double, List<double>)? predict(List<List<double>> sequence) {
     if (!_loaded) return null;
     if (sequence.length != numFrames) return null;
     if (sequence[0].length != numFeatures) return null;
 
-    // Build input tensor: shape (1, 30, 252)
-    final input = [sequence]; // wrap in batch dim
-
-    // Output: shape (1, 105)
+    final input = [sequence];
     final output = List.filled(
       1 * _labels.length,
       0.0,
