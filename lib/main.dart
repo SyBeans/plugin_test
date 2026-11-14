@@ -5,7 +5,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart'; // Required for compute()
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:face_detection_tflite/face_detection_tflite.dart';
@@ -18,7 +18,7 @@ const bool kSwapDims = true;
 const bool kUseContain = false;
 const double kOffsetShiftX = 0.0;
 const double kOffsetShiftY = 0.0;
-const double kHandScale = 1.0; // FIXED: Glued to fingertips like webcam
+const double kHandScale = 1.0;
 const double kFaceDotRadius = 3.0;
 const double kHandTipRadius = 4.0;
 const double kHandJointRadius = 1.8;
@@ -27,40 +27,26 @@ const bool kShowDebugFrame = false;
 const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
-// ═══════════════════════════════════════════════════════════
-// SIGN — TIME-BASED NATURAL STREAMING
-// ═══════════════════════════════════════════════════════════
 const int kSignFeaturesPerFrame = 126;
 const double kSignMinConfidence = 0.50;
-
 const double kSignBufferSeconds = 4.0;
 const int kSignMinFramesToPredict = 8;
-
 const int kSignMotionHistoryLen = 10;
 const double kSignMotionStartThreshold = 0.015;
-
 const int kSignPredictEveryNFrames = 2;
 const int kSignVoteWindow = 6;
 const int kSignStableVoteCount = 4;
 const double kSignCooldownSeconds = 1.0;
-
 const int kSignHandDropDelay = 6;
-
 const bool kDebugSignOrientation = false;
 
-// ═══════════════════════════════════════════════════════════
-// EMOTION
-// ═══════════════════════════════════════════════════════════
-const double kEmotionMinConfidence = 0.40;
+// 🆕 REST class name (must match labels.json index 105)
+const String kRestClassName = "REST";
 
-// FIXED for v11.8: class balancing was applied at TRAINING time.
+const double kEmotionMinConfidence = 0.40;
 const List<double> kEmotionClassWeights = [1.0, 1.0, 1.0, 1.0];
 const int kEmotionSmoothingLen = 8;
-
-// ═══════════════════════════════════════════════════════════
-// RESOLUTION-AWARE PERFORMANCE TUNING
-// ═══════════════════════════════════════════════════════════
-const int kDefaultResolutionIndex = 0; // LOW is default
+const int kDefaultResolutionIndex = 0;
 
 class Landmark {
   final double x, y, z;
@@ -94,10 +80,7 @@ const List<ResolutionOption> kResolutionOptions = [
   ResolutionOption('HIGH', ResolutionPreset.high, Icons.sd_card_alert_outlined),
 ];
 
-// ═══════════════════════════════════════════════════════════
-// ISOLATE FUNCTION FOR EMOTION CROP (Optimization #1)
-// ═══════════════════════════════════════════════════════════
-// Moving this heavy pixel math off the UI thread prevents micro-stutters.
+// ── Isolate for emotion crop ──
 List<double> _extractFaceCropInBackground(Map<String, dynamic> data) {
   final Uint8List bytes = data['bytes'];
   final int width = data['width'];
@@ -198,6 +181,10 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
+  // 🆕 GPU status flags (set after model loads)
+  bool _signUsesGpu = false;
+  bool _emotionUsesGpu = false;
+
   final List<MapEntry<int, List<double>>> _signBuffer = [];
   List<double>? _lastSignPositions;
   final List<double> _signMotionHistory = [];
@@ -211,6 +198,7 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
   String _bufferState = 'idle';
+  int _restBlockedCount = 0; // 🆕 track REST blocks
 
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
@@ -227,18 +215,8 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastMotion = 0.0;
   double _signBufSpan = 0.0;
 
-  // ══════════════════════════════════════════════════════════
-  // UNIVERSAL PERFORMANCE PROFILE
-  // ══════════════════════════════════════════════════════════
-
-  // HIGH skips every 2nd frame (because 720p is massive). LOW/MED process all.
   int get _rawFrameSkipMod => _resIndex == 2 ? 2 : 1;
-
-  // ALWAYS alternate, no matter the resolution.
-  // This guarantees only 1 MediaPipe model runs per frame, saving battery/heat.
   bool get _alternateMediaPipe => true;
-
-  // Emotion cadence: LOW=5, MED=6, HIGH=8 (slower updates on higher res to save power)
   int get _effectiveEmotionSkip =>
       _resIndex == 0 ? 5 : (_resIndex == 1 ? 6 : 8);
 
@@ -255,21 +233,22 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   Future<void> _loadModels() async {
-    // 1. Load Sign Model (Independent catch)
     try {
       await _signService.load();
+      _signUsesGpu = _signService.isGpu; // 🆕
     } catch (e, st) {
       debugPrint('❌ Sign Model load error: $e\n$st');
     }
 
-    // 2. Load Emotion Model (Independent catch)
     try {
       await _emotionService.load();
+      _emotionUsesGpu = _emotionService.isGpu; // 🆕
     } catch (e, st) {
       debugPrint('❌ Emotion Model load error: $e\n$st');
     }
 
     if (mounted) setState(() => _modelsReady = true);
+    debugPrint('✅ SIGN GPU: $_signUsesGpu | EMO GPU: $_emotionUsesGpu');
     debugPrint('✅ Model loading sequence finished');
   }
 
@@ -314,19 +293,16 @@ class _CameraScreenState extends State<CameraScreen> {
 
     _handSub ??= _handPlugin!.landmarkStream.listen((hands) {
       final lms = <Landmark>[];
-
       if (hands.isNotEmpty) {
         for (final lm in hands[0].landmarks) {
           lms.add(Landmark(lm.x, lm.y, lm.z));
         }
-
         if (hands.length > 1) {
           final h1Wrist = hands[0].landmarks[0];
           final h2Wrist = hands[1].landmarks[0];
           final dx = h1Wrist.x - h2Wrist.x;
           final dy = h1Wrist.y - h2Wrist.y;
           final dist = math.sqrt(dx * dx + dy * dy);
-
           if (dist > 0.12) {
             for (final lm in hands[1].landmarks) {
               lms.add(Landmark(lm.x, lm.y, lm.z));
@@ -334,7 +310,6 @@ class _CameraScreenState extends State<CameraScreen> {
           }
         }
       }
-
       _lastHandLandmarks = lms;
       if (lms.length >= 21) {
         final xs = lms.map((l) => l.x).toList();
@@ -407,7 +382,6 @@ class _CameraScreenState extends State<CameraScreen> {
     _processFrameCounter++;
 
     try {
-      // ALWAYS alternate now for all resolutions
       final bool isHandFrame = (_processFrameCounter % 2 == 0);
       final bool isFaceFrame = (_processFrameCounter % 2 == 1);
 
@@ -425,7 +399,6 @@ class _CameraScreenState extends State<CameraScreen> {
       if (isFaceFrame) {
         final faces = await _faceDetector?.detectFacesFromCameraImage(image);
         _lastFaceLandmarks.clear();
-
         if (faces != null && faces.isNotEmpty) {
           final mesh = faces.first.mesh;
           if (mesh != null) {
@@ -547,7 +520,6 @@ class _CameraScreenState extends State<CameraScreen> {
     final anyMotion = _signMotionHistory.any(
       (m) => m > kSignMotionStartThreshold,
     );
-
     if (!anyMotion) {
       _signActive = false;
       _signBuffer.clear();
@@ -638,6 +610,19 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (winner.value < kSignStableVoteCount) return;
 
+    // 🆕 REST IGNORE — block from sentence
+    if (winner.key == kRestClassName) {
+      debugPrint('🛑 REST BLOCKED (${winner.value}/$kSignVoteWindow)');
+      setState(() {
+        _restBlockedCount++;
+        _signVoteBuffer.clear();
+        _signCooldownUntil =
+            DateTime.now().millisecondsSinceEpoch +
+            (kSignCooldownSeconds * 1000).toInt();
+      });
+      return;
+    }
+
     if (_sentenceBuffer.isEmpty || _sentenceBuffer.last != winner.key) {
       debugPrint(
         'SIGN: committed ${winner.key} (${winner.value}/$kSignVoteWindow)',
@@ -697,8 +682,6 @@ class _CameraScreenState extends State<CameraScreen> {
       final double y1 = (cy + size * 0.35).clamp(0.0, 1.0);
 
       final yPlane = image.planes[0];
-
-      // ── Optimization #1: Run heavy math on a background Isolate ──
       final raw = await compute(_extractFaceCropInBackground, {
         'bytes': yPlane.bytes,
         'width': image.width,
@@ -798,13 +781,10 @@ class _CameraScreenState extends State<CameraScreen> {
             (a, b) => a.value >= b.value ? a : b,
           );
           smoothedLabel = winner.key;
-
           final smoothedIdx = EmotionModelService.classNames.indexOf(
             smoothedLabel,
           );
-          if (smoothedIdx >= 0) {
-            smoothedConf = weighted[smoothedIdx];
-          }
+          if (smoothedIdx >= 0) smoothedConf = weighted[smoothedIdx];
         }
 
         if (!mounted) return;
@@ -849,7 +829,7 @@ class _CameraScreenState extends State<CameraScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'Plugin Test — Streaming',
+          'Plugin Test — v5 (106 classes)',
           style: TextStyle(fontSize: 16),
         ),
         actions: [
@@ -870,6 +850,7 @@ class _CameraScreenState extends State<CameraScreen> {
               _sentenceBuffer.clear();
               _resetSignStream();
               _emotionVoteBuffer.clear();
+              _restBlockedCount = 0;
             }),
           ),
         ],
@@ -899,6 +880,9 @@ class _CameraScreenState extends State<CameraScreen> {
                   mirror: _isFrontCamera,
                   isFrontCamera: _isFrontCamera,
                   sensorOrientation: _currentCamera.sensorOrientation,
+                  showFullHand: _signUsesGpu, // 🆕 21 pts if GPU, else 6
+                  faceIsGreen:
+                      _emotionUsesGpu, // 🆕 green if GPU, else light green
                 ),
               ),
             ),
@@ -985,12 +969,45 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
           const SizedBox(height: 2),
           Text(
-            'ALT (ALL RES) | skip=$_rawFrameSkipMod | emo=1/$_effectiveEmotionSkip',
+            'ALT | skip=$_rawFrameSkipMod | emo=1/$_effectiveEmotionSkip',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
-          const SizedBox(height: 6),
-          const Divider(color: Colors.white24, height: 1),
-          const SizedBox(height: 6),
+          const SizedBox(height: 4),
+          // 🆕 GPU status
+          Row(
+            children: [
+              Text(
+                'SIGN: ${_signUsesGpu ? "GPU" : "CPU"}',
+                style: TextStyle(
+                  color: _signUsesGpu
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const Text(
+                '  ·  ',
+                style: TextStyle(color: Colors.white38, fontSize: 9),
+              ),
+              Text(
+                'EMO: ${_emotionUsesGpu ? "GPU" : "CPU"}',
+                style: TextStyle(
+                  color: _emotionUsesGpu
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Hands: ${_signUsesGpu ? "21 pts (full)" : "6 pts (min)"}',
+            style: const TextStyle(color: Colors.white54, fontSize: 8),
+          ),
+          const Divider(color: Colors.white24, height: 8),
           const Text(
             'ROTATION',
             style: TextStyle(
@@ -1002,14 +1019,12 @@ class _CameraScreenState extends State<CameraScreen> {
           ),
           const SizedBox(height: 4),
           GestureDetector(
-            onTap: () {
-              setState(() {
-                _cropRotation = (_cropRotation + 90) % 360;
-              });
-            },
+            onTap: () => setState(() {
+              _cropRotation = (_cropRotation + 90) % 360;
+            }),
             child: Container(
               width: double.infinity,
-              padding: const EdgeInsets.symmetric(vertical: 8),
+              padding: const EdgeInsets.symmetric(vertical: 6),
               decoration: BoxDecoration(
                 color: Colors.white.withOpacity(0.12),
                 borderRadius: BorderRadius.circular(6),
@@ -1019,15 +1034,15 @@ class _CameraScreenState extends State<CameraScreen> {
                 children: [
                   const Icon(
                     Icons.rotate_right,
-                    size: 16,
+                    size: 14,
                     color: Colors.yellowAccent,
                   ),
-                  const SizedBox(width: 8),
+                  const SizedBox(width: 6),
                   Text(
                     'Crop: ${_cropRotation}°',
                     style: const TextStyle(
                       color: Colors.yellowAccent,
-                      fontSize: 12,
+                      fontSize: 11,
                       fontWeight: FontWeight.bold,
                     ),
                   ),
@@ -1035,9 +1050,9 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
             ),
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: 4),
           const Divider(color: Colors.white24, height: 1),
-          const SizedBox(height: 6),
+          const SizedBox(height: 4),
           const Text(
             'EMOTION',
             style: TextStyle(
@@ -1052,7 +1067,7 @@ class _CameraScreenState extends State<CameraScreen> {
           _tinyProb('Neg', _lastEmotionProbs[1]),
           _tinyProb('Sur', _lastEmotionProbs[2]),
           _tinyProb('Neu', _lastEmotionProbs[3]),
-          const SizedBox(height: 4),
+          const SizedBox(height: 3),
           Text(
             _emotionError == null
                 ? '→ $_lastEmotion (${(_lastEmotionConf * 100).toStringAsFixed(0)}%)'
@@ -1086,6 +1101,15 @@ class _CameraScreenState extends State<CameraScreen> {
           Text(
             'motion ${_lastMotion.toStringAsFixed(3)}  votes ${_signVoteBuffer.length}/6',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
+          ),
+          // 🆕 REST blocked counter
+          Text(
+            '🛑 REST blocked: $_restBlockedCount',
+            style: const TextStyle(
+              color: Colors.redAccent,
+              fontSize: 9,
+              fontWeight: FontWeight.bold,
+            ),
           ),
           const SizedBox(height: 4),
           if (_lastSignProbs.isNotEmpty)
@@ -1251,12 +1275,16 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Widget _buildSignPanel() {
     final confPct = (_lastSignConf * 100).toStringAsFixed(0);
+    final isRest = _lastSign == kRestClassName;
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.75),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.greenAccent, width: 2),
+        border: Border.all(
+          color: isRest ? Colors.redAccent : Colors.greenAccent,
+          width: 2,
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1264,10 +1292,10 @@ class _CameraScreenState extends State<CameraScreen> {
         children: [
           Row(
             children: [
-              const Text(
-                'SIGN: ',
+              Text(
+                isRest ? '🛑 BLOCKED: ' : 'SIGN: ',
                 style: TextStyle(
-                  color: Colors.greenAccent,
+                  color: isRest ? Colors.redAccent : Colors.greenAccent,
                   fontWeight: FontWeight.bold,
                   fontSize: 12,
                 ),
@@ -1275,8 +1303,8 @@ class _CameraScreenState extends State<CameraScreen> {
               Expanded(
                 child: Text(
                   _lastSign.toUpperCase(),
-                  style: const TextStyle(
-                    color: Colors.white,
+                  style: TextStyle(
+                    color: isRest ? Colors.redAccent : Colors.white,
                     fontWeight: FontWeight.bold,
                     fontSize: 22,
                   ),
@@ -1284,7 +1312,9 @@ class _CameraScreenState extends State<CameraScreen> {
               ),
               Text(
                 '$confPct%',
-                style: const TextStyle(color: Colors.greenAccent),
+                style: TextStyle(
+                  color: isRest ? Colors.redAccent : Colors.greenAccent,
+                ),
               ),
             ],
           ),
@@ -1306,7 +1336,7 @@ class _CameraScreenState extends State<CameraScreen> {
 }
 
 // ============================================================
-// LANDMARK PAINTER (MINIMALIST DOTS ONLY)
+// LANDMARK PAINTER — Conditional 21 pts (GPU) vs 6 pts (CPU)
 // ============================================================
 class LandmarkPainter extends CustomPainter {
   final List<Landmark> faceLandmarks;
@@ -1315,6 +1345,8 @@ class LandmarkPainter extends CustomPainter {
   final bool mirror;
   final bool isFrontCamera;
   final int sensorOrientation;
+  final bool showFullHand; // 🆕 true = 21 pts + connections, false = 6 minimal
+  final bool faceIsGreen; // 🆕 true = green, false = light green
 
   LandmarkPainter({
     required this.faceLandmarks,
@@ -1323,7 +1355,19 @@ class LandmarkPainter extends CustomPainter {
     required this.mirror,
     required this.isFrontCamera,
     required this.sensorOrientation,
+    required this.showFullHand,
+    required this.faceIsGreen,
   });
+
+  // MediaPipe standard hand connections for full 21-pt skeleton
+  static const List<List<int>> _handConnections = [
+    [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
+    [0, 5], [5, 6], [6, 7], [7, 8], // Index
+    [5, 9], [9, 10], [10, 11], [11, 12], // Middle
+    [9, 13], [13, 14], [14, 15], [15, 16], // Ring
+    [13, 17], [17, 18], [18, 19], [19, 20], // Pinky
+    [0, 17], // Palm
+  ];
 
   Offset _rotate(double x, double y) {
     if (isFrontCamera) {
@@ -1350,8 +1394,7 @@ class LandmarkPainter extends CustomPainter {
 
   Offset _mapFace(Landmark lm, double sw, double sh, double ox, double oy) {
     var p = _rotate(lm.x, lm.y);
-    double nx = p.dx;
-    double ny = p.dy;
+    double nx = p.dx, ny = p.dy;
     if (mirror) nx = 1.0 - nx;
     nx += kOffsetShiftX;
     ny += kOffsetShiftY;
@@ -1370,8 +1413,7 @@ class LandmarkPainter extends CustomPainter {
     final sx = anchor.dx + (lm.x - anchor.dx) * scale;
     final sy = anchor.dy + (lm.y - anchor.dy) * scale;
     var p = _rotate(sx, sy);
-    double nx = p.dx;
-    double ny = p.dy;
+    double nx = p.dx, ny = p.dy;
     if (mirror) nx = 1.0 - nx;
     nx += kOffsetShiftX;
     ny += kOffsetShiftY;
@@ -1399,8 +1441,13 @@ class LandmarkPainter extends CustomPainter {
     final offsetX = (size.width - scaledW) / 2;
     final offsetY = (size.height - scaledH) / 2;
 
+    // 🆕 Face color: green if GPU, light green if CPU
+    final faceColor = faceIsGreen
+        ? Colors.green.withOpacity(kFaceDotOpacity)
+        : Colors.lightGreen.withOpacity(kFaceDotOpacity * 0.8);
+
     final paintFace = Paint()
-      ..color = Colors.red.withOpacity(kFaceDotOpacity)
+      ..color = faceColor
       ..style = PaintingStyle.fill;
 
     if (faceLandmarks.length >= 455) {
@@ -1418,10 +1465,15 @@ class LandmarkPainter extends CustomPainter {
       }
     }
 
+    // 🆕 HANDS: conditional 21 vs 6 points
     final paintHand = Paint()
       ..color = Colors.green
-      ..strokeWidth = 2.0
       ..style = PaintingStyle.fill;
+    final handLine = Paint()
+      ..color = Colors.green.withOpacity(0.7)
+      ..strokeWidth = 2.0
+      ..style = PaintingStyle.stroke;
+
     const perHand = 21;
     const double rejectRadius = 0.35;
 
@@ -1437,26 +1489,70 @@ class LandmarkPainter extends CustomPainter {
       cy /= slice.length;
       final anchor = Offset(cx, cy);
 
-      const handIndices = [0, 4, 8, 12, 16, 20];
+      if (showFullHand) {
+        // ── FULL 21-POINT SKELETON ──
+        final pts = <Offset?>[];
+        for (final lm in slice) {
+          final dx = (lm.x - cx).abs();
+          final dy = (lm.y - cy).abs();
+          if (dx > rejectRadius || dy > rejectRadius) {
+            pts.add(null);
+            continue;
+          }
+          pts.add(
+            _mapHand(
+              lm,
+              scaledW,
+              scaledH,
+              offsetX,
+              offsetY,
+              anchor,
+              kHandScale,
+            ),
+          );
+        }
 
-      for (final idx in handIndices) {
-        final lm = slice[idx];
-        final dx = (lm.x - cx).abs();
-        final dy = (lm.y - cy).abs();
+        // Draw connections
+        for (final c in _handConnections) {
+          final a = pts[c[0]];
+          final b = pts[c[1]];
+          if (a != null && b != null) canvas.drawLine(a, b, handLine);
+        }
 
-        if (dx > rejectRadius || dy > rejectRadius) continue;
+        // Draw all 21 points
+        for (int i = 0; i < pts.length; i++) {
+          final p = pts[i];
+          if (p == null) continue;
+          final isTip =
+              i == 0 || i == 4 || i == 8 || i == 12 || i == 16 || i == 20;
+          canvas.drawCircle(
+            p,
+            isTip ? kHandTipRadius : kHandJointRadius,
+            paintHand,
+          );
+          if (isTip) canvas.drawCircle(p, 1.5, Paint()..color = Colors.white);
+        }
+      } else {
+        // ── MINIMAL 6-POINT (wrist + 5 fingertips) ──
+        const handIndices = [0, 4, 8, 12, 16, 20];
+        for (final idx in handIndices) {
+          final lm = slice[idx];
+          final dx = (lm.x - cx).abs();
+          final dy = (lm.y - cy).abs();
+          if (dx > rejectRadius || dy > rejectRadius) continue;
 
-        final p = _mapHand(
-          lm,
-          scaledW,
-          scaledH,
-          offsetX,
-          offsetY,
-          anchor,
-          kHandScale,
-        );
-        canvas.drawCircle(p, kHandTipRadius, paintHand);
-        canvas.drawCircle(p, 1.5, Paint()..color = Colors.white);
+          final p = _mapHand(
+            lm,
+            scaledW,
+            scaledH,
+            offsetX,
+            offsetY,
+            anchor,
+            kHandScale,
+          );
+          canvas.drawCircle(p, kHandTipRadius, paintHand);
+          canvas.drawCircle(p, 1.5, Paint()..color = Colors.white);
+        }
       }
     }
   }

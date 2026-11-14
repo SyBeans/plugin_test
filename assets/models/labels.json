@@ -10,9 +10,9 @@
   "YOURE WELCOME",
   "SEE YOU TOMORROW",
   "UNDERSTAND",
-  "DON\u2019T UNDERSTAND",
+  "DON'T UNDERSTAND",
   "KNOW",
-  "DON\u2019T KNOW",
+  "DON'T KNOW",
   "NO",
   "YES",
   "WRONG",
@@ -27,7 +27,7 @@
   "SIX",
   "SEVEN",
   "EIGHT",
-  "NINE ",
+  "NINE",
   "TEN",
   "JANUARY",
   "FEBRUARY",
@@ -103,5 +103,6 @@
   "BEER",
   "WINE",
   "SUGAR",
-  "NO SUGAR"
+  "NO SUGAR",
+  "REST"
 ]
