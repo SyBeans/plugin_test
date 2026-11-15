@@ -28,7 +28,8 @@ const int kBackRotationMode = 1;
 const double kMinHandSpan = 0.12;
 
 const int kSignFeaturesPerFrame = 126;
-const double kSignMinConfidence = 0.50;
+// 🆕 FIX B: 0.50 → 0.45 (v5 has 106 classes, top confidence is lower)
+const double kSignMinConfidence = 0.45;
 const double kSignBufferSeconds = 4.0;
 const int kSignMinFramesToPredict = 8;
 const int kSignMotionHistoryLen = 10;
@@ -40,7 +41,7 @@ const double kSignCooldownSeconds = 1.0;
 const int kSignHandDropDelay = 6;
 const bool kDebugSignOrientation = false;
 
-// 🆕 REST class name (must match labels.json index 105)
+// 🆕 REST class name
 const String kRestClassName = "REST";
 
 const double kEmotionMinConfidence = 0.40;
@@ -80,7 +81,6 @@ const List<ResolutionOption> kResolutionOptions = [
   ResolutionOption('HIGH', ResolutionPreset.high, Icons.sd_card_alert_outlined),
 ];
 
-// ── Isolate for emotion crop ──
 List<double> _extractFaceCropInBackground(Map<String, dynamic> data) {
   final Uint8List bytes = data['bytes'];
   final int width = data['width'];
@@ -181,7 +181,6 @@ class _CameraScreenState extends State<CameraScreen> {
   final EmotionModelService _emotionService = EmotionModelService();
   bool _modelsReady = false;
 
-  // 🆕 GPU status flags (set after model loads)
   bool _signUsesGpu = false;
   bool _emotionUsesGpu = false;
 
@@ -198,7 +197,8 @@ class _CameraScreenState extends State<CameraScreen> {
   double _lastSignConf = 0.0;
   final List<String> _sentenceBuffer = [];
   String _bufferState = 'idle';
-  int _restBlockedCount = 0; // 🆕 track REST blocks
+  int _restBlockedCount = 0;
+  int _restWeakCount = 0; // 🆕 track ignored weak REST
 
   int _emotionFrameCounter = 0;
   String _lastEmotion = '—';
@@ -235,14 +235,14 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _loadModels() async {
     try {
       await _signService.load();
-      _signUsesGpu = _signService.isGpu; // 🆕
+      _signUsesGpu = _signService.isGpu;
     } catch (e, st) {
       debugPrint('❌ Sign Model load error: $e\n$st');
     }
 
     try {
       await _emotionService.load();
-      _emotionUsesGpu = _emotionService.isGpu; // 🆕
+      _emotionUsesGpu = _emotionService.isGpu;
     } catch (e, st) {
       debugPrint('❌ Emotion Model load error: $e\n$st');
     }
@@ -610,16 +610,27 @@ class _CameraScreenState extends State<CameraScreen> {
 
     if (winner.value < kSignStableVoteCount) return;
 
-    // 🆕 REST IGNORE — block from sentence
+    // 🆕 FIX A: REST only blocks at 6/6 (unanimous)
     if (winner.key == kRestClassName) {
-      debugPrint('🛑 REST BLOCKED (${winner.value}/$kSignVoteWindow)');
-      setState(() {
-        _restBlockedCount++;
-        _signVoteBuffer.clear();
-        _signCooldownUntil =
-            DateTime.now().millisecondsSinceEpoch +
-            (kSignCooldownSeconds * 1000).toInt();
-      });
+      if (winner.value >= 6) {
+        // Unanimous REST → real idle → block
+        debugPrint('🛑 REST BLOCKED (${winner.value}/$kSignVoteWindow)');
+        setState(() {
+          _restBlockedCount++;
+          _signVoteBuffer.clear();
+          _signCooldownUntil =
+              DateTime.now().millisecondsSinceEpoch +
+              (kSignCooldownSeconds * 1000).toInt();
+        });
+      } else {
+        // 4-5/6 → weak REST signal → ignore, let real signs win
+        debugPrint(
+          '🟡 REST weak (${winner.value}/$kSignVoteWindow) — ignoring',
+        );
+        setState(() {
+          _restWeakCount++;
+        });
+      }
       return;
     }
 
@@ -851,6 +862,7 @@ class _CameraScreenState extends State<CameraScreen> {
               _resetSignStream();
               _emotionVoteBuffer.clear();
               _restBlockedCount = 0;
+              _restWeakCount = 0;
             }),
           ),
         ],
@@ -880,9 +892,8 @@ class _CameraScreenState extends State<CameraScreen> {
                   mirror: _isFrontCamera,
                   isFrontCamera: _isFrontCamera,
                   sensorOrientation: _currentCamera.sensorOrientation,
-                  showFullHand: _signUsesGpu, // 🆕 21 pts if GPU, else 6
-                  faceIsGreen:
-                      _emotionUsesGpu, // 🆕 green if GPU, else light green
+                  showFullHand: _signUsesGpu,
+                  faceIsGreen: _emotionUsesGpu,
                 ),
               ),
             ),
@@ -973,7 +984,6 @@ class _CameraScreenState extends State<CameraScreen> {
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
           const SizedBox(height: 4),
-          // 🆕 GPU status
           Row(
             children: [
               Text(
@@ -1102,9 +1112,9 @@ class _CameraScreenState extends State<CameraScreen> {
             'motion ${_lastMotion.toStringAsFixed(3)}  votes ${_signVoteBuffer.length}/6',
             style: const TextStyle(color: Colors.white70, fontSize: 9),
           ),
-          // 🆕 REST blocked counter
+          // 🆕 REST counters
           Text(
-            '🛑 REST blocked: $_restBlockedCount',
+            '🛑 REST blocked: $_restBlockedCount  🟡 weak: $_restWeakCount',
             style: const TextStyle(
               color: Colors.redAccent,
               fontSize: 9,
@@ -1345,8 +1355,8 @@ class LandmarkPainter extends CustomPainter {
   final bool mirror;
   final bool isFrontCamera;
   final int sensorOrientation;
-  final bool showFullHand; // 🆕 true = 21 pts + connections, false = 6 minimal
-  final bool faceIsGreen; // 🆕 true = green, false = light green
+  final bool showFullHand;
+  final bool faceIsGreen;
 
   LandmarkPainter({
     required this.faceLandmarks,
@@ -1359,14 +1369,28 @@ class LandmarkPainter extends CustomPainter {
     required this.faceIsGreen,
   });
 
-  // MediaPipe standard hand connections for full 21-pt skeleton
   static const List<List<int>> _handConnections = [
-    [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
-    [0, 5], [5, 6], [6, 7], [7, 8], // Index
-    [5, 9], [9, 10], [10, 11], [11, 12], // Middle
-    [9, 13], [13, 14], [14, 15], [15, 16], // Ring
-    [13, 17], [17, 18], [18, 19], [19, 20], // Pinky
-    [0, 17], // Palm
+    [0, 1],
+    [1, 2],
+    [2, 3],
+    [3, 4],
+    [0, 5],
+    [5, 6],
+    [6, 7],
+    [7, 8],
+    [5, 9],
+    [9, 10],
+    [10, 11],
+    [11, 12],
+    [9, 13],
+    [13, 14],
+    [14, 15],
+    [15, 16],
+    [13, 17],
+    [17, 18],
+    [18, 19],
+    [19, 20],
+    [0, 17],
   ];
 
   Offset _rotate(double x, double y) {
@@ -1441,7 +1465,6 @@ class LandmarkPainter extends CustomPainter {
     final offsetX = (size.width - scaledW) / 2;
     final offsetY = (size.height - scaledH) / 2;
 
-    // 🆕 Face color: green if GPU, light green if CPU
     final faceColor = faceIsGreen
         ? Colors.green.withOpacity(kFaceDotOpacity)
         : Colors.lightGreen.withOpacity(kFaceDotOpacity * 0.8);
@@ -1465,7 +1488,6 @@ class LandmarkPainter extends CustomPainter {
       }
     }
 
-    // 🆕 HANDS: conditional 21 vs 6 points
     final paintHand = Paint()
       ..color = Colors.green
       ..style = PaintingStyle.fill;
@@ -1490,7 +1512,6 @@ class LandmarkPainter extends CustomPainter {
       final anchor = Offset(cx, cy);
 
       if (showFullHand) {
-        // ── FULL 21-POINT SKELETON ──
         final pts = <Offset?>[];
         for (final lm in slice) {
           final dx = (lm.x - cx).abs();
@@ -1512,14 +1533,12 @@ class LandmarkPainter extends CustomPainter {
           );
         }
 
-        // Draw connections
         for (final c in _handConnections) {
           final a = pts[c[0]];
           final b = pts[c[1]];
           if (a != null && b != null) canvas.drawLine(a, b, handLine);
         }
 
-        // Draw all 21 points
         for (int i = 0; i < pts.length; i++) {
           final p = pts[i];
           if (p == null) continue;
@@ -1533,7 +1552,6 @@ class LandmarkPainter extends CustomPainter {
           if (isTip) canvas.drawCircle(p, 1.5, Paint()..color = Colors.white);
         }
       } else {
-        // ── MINIMAL 6-POINT (wrist + 5 fingertips) ──
         const handIndices = [0, 4, 8, 12, 16, 20];
         for (final idx in handIndices) {
           final lm = slice[idx];
