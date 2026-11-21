@@ -13,6 +13,7 @@ import 'package:hand_landmarker/hand_landmarker.dart';
 
 import 'services/sign_model_service.dart';
 import 'services/emotion_model_service.dart';
+import 'services/engineered_features.dart'; // 🆕 v12.3
 
 const bool kSwapDims = true;
 const bool kUseContain = false;
@@ -43,7 +44,8 @@ const bool kDebugSignOrientation = false;
 const String kRestClassName = "REST";
 
 const double kEmotionMinConfidence = 0.40;
-const List<double> kEmotionClassWeights = [1.0, 1.0, 1.0, 1.0];
+// 🆕 v12.3: kEmotionClassWeights REMOVED — no post-softmax re-weighting anymore.
+// Class weights {1.0, 1.45, 1.05, 1.0} were applied at training time only.
 const int kEmotionSmoothingLen = 8;
 const int kDefaultResolutionIndex = 0;
 
@@ -439,8 +441,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
 
       // 🆕 Optimization #1: Throttle setState to ~12.5 UI updates/sec
-      // Landmarks still update internally every frame — only screen redraw is throttled.
-      // This frees main thread → +2-4 FPS without any accuracy loss.
       final shouldUpdateUI = (now - _lastUIUpdateMs) >= kUIThrottleMs;
       if (mounted && shouldUpdateUI) {
         _lastUIUpdateMs = now;
@@ -460,8 +460,6 @@ class _CameraScreenState extends State<CameraScreen> {
       }
 
       // 🆕 Optimization #2: Skip emotion while actively signing
-      // Emotion freezes during signing (acceptable — user is focused on words).
-      // Saves ~1-2 FPS because CNN doesn't compete with sign pipeline.
       if (_modelsReady &&
           isFaceFrame &&
           _lastFaceLandmarks.length >= 400 &&
@@ -682,6 +680,9 @@ class _CameraScreenState extends State<CameraScreen> {
     _lastSign = '—';
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // 🆕 v12.3 EMOTION INFERENCE — 3-input (image + landmarks + engineered)
+  // ════════════════════════════════════════════════════════════════
   Future<void> _runEmotionInference(
     CameraImage image,
     List<Landmark> faceLandmarks,
@@ -765,23 +766,19 @@ class _CameraScreenState extends State<CameraScreen> {
       }
       final lmMean = lmSum / lmVec.length;
 
-      final result = _emotionService.predict(crop, lmVec);
+      // 🆕 v12.3: compute 26 engineered features (Dart port of Python precompute)
+      final engineered = engineeredFeatures(lmVec);
+
+      // 🆕 v12.3: 3-input predict
+      final result = _emotionService.predict(crop, lmVec, engineered);
       if (result == null) {
         localError = 'predict → null';
       } else {
         final (_, _, rawProbs) = result;
 
-        final weighted = List<double>.filled(4, 0.0);
-        double wSum = 0.0;
-        for (int i = 0; i < 4; i++) {
-          weighted[i] = rawProbs[i] * kEmotionClassWeights[i];
-          wSum += weighted[i];
-        }
-        if (wSum > 0) {
-          for (int i = 0; i < 4; i++) {
-            weighted[i] /= wSum;
-          }
-        }
+        // 🆕 v12.3: raw softmax — no post-softmax re-weighting.
+        // Class weights {1.0, 1.45, 1.05, 1.0} were applied at TRAIN time only.
+        final weighted = rawProbs;
 
         int frameIdx = 0;
         double frameTop = weighted[0];
@@ -859,7 +856,7 @@ class _CameraScreenState extends State<CameraScreen> {
     return Scaffold(
       appBar: AppBar(
         title: const Text(
-          'Plugin Test — v5 (106 classes)',
+          'Plugin Test — v5 (106 classes) + v12.3 emo',
           style: TextStyle(fontSize: 16),
         ),
         actions: [
@@ -976,13 +973,11 @@ class _CameraScreenState extends State<CameraScreen> {
   }
 
   // 🆕 Debug strip — COLLAPSIBLE. Tap the small pill to expand/collapse.
-  // Collapsed by default → doesn't cover your face.
   Widget _buildDebugStrip() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.end,
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Toggle pill
         GestureDetector(
           onTap: () => setState(() => _debugExpanded = !_debugExpanded),
           child: Container(
@@ -1123,7 +1118,7 @@ class _CameraScreenState extends State<CameraScreen> {
                 const Divider(color: Colors.white24, height: 1),
                 const SizedBox(height: 4),
                 const Text(
-                  'EMOTION',
+                  'EMOTION (v12.3 · 3-input)',
                   style: TextStyle(
                     color: Colors.pinkAccent,
                     fontSize: 9,
